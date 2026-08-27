@@ -7,10 +7,13 @@ terminate a stream explicitly, and never report a truncated response as clean.
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import httpx
 import pytest
 
-from switchyard.synthetic.profiles import FaultSpec
+from switchyard.synthetic.profiles import FaultSpec, ProviderProfile
 
 BODY = {"model": "quick", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 64}
 
@@ -150,3 +153,68 @@ async def test_metrics_endpoint_exposes_switchyard_series(gateway_server):
         "switchyard_event_loop_lag_seconds",
     ):
         assert series in r.text
+
+
+# -- cancellation ----------------------------------------------------------
+
+
+async def _inflight(base_url: str) -> float:
+    async with httpx.AsyncClient() as c:
+        text = (await c.get(f"{base_url}/metrics")).text
+    for line in text.splitlines():
+        if line.startswith("switchyard_inflight{"):
+            return float(line.rsplit(" ", 1)[1])
+    return 0.0
+
+
+async def test_client_disconnect_releases_the_upstream_promptly(gateway_server):
+    """A client that walks away must not leave the provider generating.
+
+    Every token produced after the client is gone is paid for and thrown away,
+    and the capacity slot it occupies is unavailable to anyone else. This
+    currently works because Starlette closes the response generator on
+    disconnect, which finalizes the adapter's generator and exits its
+    `async with httpx.stream(...)`. That chain is incidental rather than
+    explicit, so this test exists to catch a silent regression when the pump is
+    restructured for cancellation propagation and bounded buffering.
+
+    Observed propagation at the time of writing: ~11ms. The assertion is loose
+    enough not to be flaky on a loaded CI machine while still being far below
+    the ~10s the stream would take to finish on its own.
+    """
+    stream_seconds = 10.0
+    gateway_server.fleet.state.profiles["quick"] = ProviderProfile(
+        name="quick", ttft_median_ms=10.0, ttft_sigma=0.01,
+        output_tokens_median=400.0, output_tokens_sigma=0.01,
+        tokens_per_second=40.0, token_jitter_sigma=0.0,
+    )
+
+    started = time.perf_counter()
+    async with (
+        httpx.AsyncClient(timeout=30.0) as c,
+        c.stream("POST", f"{gateway_server.base_url}/v1/chat/completions",
+                 json=BODY | {"stream": True, "max_tokens": 4096}) as r,
+    ):
+        assert r.status_code == 200
+        seen = 0
+        async for line in r.aiter_lines():
+            if line.startswith("data: ") and '"content"' in line:
+                seen += 1
+                if seen >= 5:
+                    break                      # client walks away
+    assert seen == 5
+
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        if await _inflight(gateway_server.base_url) == 0.0:
+            break
+        await asyncio.sleep(0.01)
+
+    released_after = time.perf_counter() - started
+    assert await _inflight(gateway_server.base_url) == 0.0, (
+        "upstream still in flight after the client disconnected"
+    )
+    assert released_after < stream_seconds / 2, (
+        f"released after {released_after:.2f}s; the stream would have run "
+        f"~{stream_seconds:.0f}s, so this did not propagate"
+    )

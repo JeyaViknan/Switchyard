@@ -13,13 +13,37 @@ at rate lambda -- and fires each request at its scheduled time whether or not
 earlier requests have finished. Every latency is measured from the request's
 *intended* start, so time spent waiting because the system was busy is counted.
 
+Reproducibility
+---------------
+Request ids are derived from `(seed, index)`, not randomly. The synthetic fleet
+keys every per-request draw on `(run_seed, request_id)`, so random ids would mean
+two runs of the same spec produced different output lengths, different time to
+first token, and different fault decisions -- making an A/B comparison between
+two scheduling policies a comparison of two different workloads. Deterministic
+ids are what closes that loop.
+
 Self-check
 ----------
-An open-loop generator can itself become the bottleneck. `scheduling_lag`
-(actual start minus intended start) measures that directly. If it grows over a
-run, the generator could not keep up and the run's latency numbers understate
-the truth -- the run should be discarded or re-run with less load per process.
-Reporting it is not optional; it is what makes the rest of the numbers credible.
+An open-loop generator can itself become the bottleneck, and when it does the
+measurement understates real latency. Three signals are reported on every run:
+
+- `scheduling_lag` -- how late each request actually fired. Judged as a *ratio*
+  of typical latency rather than against a fixed millisecond threshold, since
+  20ms of lag is negligible against a 2s request and severe against a 50ms one.
+- connection saturation -- if concurrent requests reach the client's connection
+  limit, further arrivals block on the pool and the generator has silently
+  stopped being open-loop.
+- file-descriptor headroom -- checked before the run starts, so fd exhaustion
+  surfaces as a clear error instead of masquerading as failures in the system
+  under test.
+
+Measurement window
+------------------
+Requests whose scheduled arrival falls in the warmup period are issued normally
+but excluded from reported statistics. Warmup exists because the first requests
+of a run pay for TCP connection establishment and cold code paths, which is not
+what the experiment is measuring. Every reported statistic covers exactly the
+requests with `in_window=True`.
 """
 
 from __future__ import annotations
@@ -27,14 +51,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import resource
 import time
-import uuid
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 
 import httpx
 import numpy as np
 import orjson
+
+# Default ceiling on concurrent connections from the generator. High enough not
+# to constrain the offered load in normal use, low enough to stay clear of a
+# typical file-descriptor limit.
+DEFAULT_MAX_CONNECTIONS = 1000
+
+# Lag is judged against typical latency: a run is suspect when p99 scheduling lag
+# exceeds this fraction of median request latency.
+LAG_RATIO_THRESHOLD = 0.05
 
 
 @dataclass(slots=True)
@@ -52,6 +85,7 @@ class RequestRecord:
     prompt_tokens: int = 0
     finish_reason: str | None = None
     error: str | None = None
+    in_window: bool = True
     inter_token_s: list[float] = field(default_factory=list)
 
     # -- derived, all measured from intended_start ------------------------
@@ -77,8 +111,15 @@ class RequestRecord:
         return self.status == 200 and self.error is None
 
     def to_row(self) -> dict[str, object]:
+        """Row for persistence.
+
+        The full inter-token sample list is kept, not just its mean. Pooling
+        per-request means would make an inter-token tail percentile
+        uncomputable, and inter-token latency is a tail metric -- a stream whose
+        mean gap is fine but whose p99 gap is 400ms reads as stuttering to a
+        user, and a mean cannot show that.
+        """
         row = asdict(self)
-        row.pop("inter_token_s")
         row.update(
             scheduling_lag=self.scheduling_lag,
             ttft=self.ttft,
@@ -102,6 +143,8 @@ class LoadSpec:
     max_tokens: int = 4096
     seed: int = 1
     request_timeout_s: float = 120.0
+    warmup_s: float = 0.0
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
 
 
 async def _run_one(
@@ -168,6 +211,16 @@ async def _run_one(
     return record
 
 
+def request_id_for(seed: int, index: int) -> str:
+    """Stable id for the n-th request of a run.
+
+    Same seed and index always yield the same id, which is what makes the
+    synthetic fleet reproduce a workload exactly. Vary `seed` to get an
+    independent sample; keep it fixed to compare policies on identical work.
+    """
+    return f"lg-{seed}-{index}"
+
+
 def arrival_schedule(rate: float, duration_s: float, seed: int) -> np.ndarray:
     """Poisson arrival offsets, in seconds from run start.
 
@@ -181,14 +234,63 @@ def arrival_schedule(rate: float, duration_s: float, seed: int) -> np.ndarray:
     return times[times < duration_s]
 
 
+def check_fd_headroom(max_connections: int) -> None:
+    """Fail before the run rather than during it.
+
+    File-descriptor exhaustion surfaces as connection errors that look exactly
+    like the system under test refusing connections. Checking up front means the
+    benchmark cannot quietly report the client's limits as the server's.
+    """
+    soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    needed = max_connections + 64          # sockets, plus the process's own files
+    if soft != resource.RLIM_INFINITY and needed > soft:
+        raise RuntimeError(
+            f"generator needs ~{needed} file descriptors for "
+            f"max_connections={max_connections}, but the soft limit is {soft}. "
+            f"Raise it (ulimit -n {needed}) or lower --max-connections."
+        )
+
+
+@dataclass(slots=True)
+class RunOutcome:
+    """Records plus the generator's own health signals for the run."""
+
+    records: list[RequestRecord]
+    peak_concurrency: int
+    connection_limited: bool
+
+
 async def run_load(spec: LoadSpec) -> list[RequestRecord]:
+    """Run a load spec and return its records. See `run_load_detailed`."""
+    return (await run_load_detailed(spec)).records
+
+
+async def run_load_detailed(spec: LoadSpec) -> RunOutcome:
+    check_fd_headroom(spec.max_connections)
+
     offsets = arrival_schedule(spec.rate, spec.duration_s, spec.seed)
     records: list[RequestRecord] = []
     tasks: list[asyncio.Task[RequestRecord]] = []
 
-    limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    live = 0
+    peak = 0
+
+    limits = httpx.Limits(
+        max_connections=spec.max_connections,
+        max_keepalive_connections=spec.max_connections,
+    )
     async with httpx.AsyncClient(limits=limits) as client:
         run_start = time.perf_counter()
+
+        async def tracked(record: RequestRecord) -> RequestRecord:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            try:
+                return await _run_one(client, spec, record)
+            finally:
+                live -= 1
+
         for i, offset in enumerate(offsets):
             intended = run_start + float(offset)
             delay = intended - time.perf_counter()
@@ -196,22 +298,25 @@ async def run_load(spec: LoadSpec) -> list[RequestRecord]:
                 await asyncio.sleep(delay)
 
             record = RequestRecord(
-                request_id=f"lg-{uuid.uuid4().hex[:12]}",
+                # Deterministic, not random: see "Reproducibility" above.
+                request_id=request_id_for(spec.seed, i),
                 tenant=spec.tenants[i % len(spec.tenants)],
                 intended_start=intended,
+                in_window=float(offset) >= spec.warmup_s,
             )
             records.append(record)
-            tasks.append(asyncio.create_task(_run_one(client, spec, record)))
+            tasks.append(asyncio.create_task(tracked(record)))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    return records
 
-
-def _cancel_all(tasks: Sequence[asyncio.Task[RequestRecord]]) -> None:
-    for task in tasks:
-        if not task.done():
-            task.cancel()
+    return RunOutcome(
+        records=records,
+        peak_concurrency=peak,
+        # At the cap, further arrivals block on the connection pool instead of
+        # being issued -- the generator has stopped being open-loop.
+        connection_limited=peak >= spec.max_connections,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

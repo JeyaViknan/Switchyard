@@ -25,7 +25,12 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from switchyard.adapters.synthetic import SyntheticAdapter, build_client
 from switchyard.gateway.stream import collect, to_sse
-from switchyard.obs.metrics import REGISTRY, monitor_event_loop_lag, track_inflight
+from switchyard.obs.metrics import (
+    REGISTRY,
+    RequestTimeline,
+    monitor_event_loop_lag,
+    track_inflight,
+)
 from switchyard.types import CompletionRequest, Message
 
 # Fields Switchyard knowingly does not implement. Rejected by name so a caller
@@ -122,6 +127,10 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        # Started before parsing and routing so that every span the observability
+        # model reports is measured from the moment the request landed. Once
+        # admission control exists, its queue wait is recorded onto this object.
+        timeline = RequestTimeline()
         request_id = request.headers.get("x-switchyard-request-id") or f"sy-{uuid.uuid4().hex[:12]}"
         parsed = parse_request(await request.json(), request_id)
 
@@ -135,7 +144,9 @@ def create_app(
         if parsed.stream:
             async def body_iter():
                 async with track_inflight(adapter.name):
-                    async for frame in to_sse(adapter.stream(parsed), parsed, adapter.name):
+                    async for frame in to_sse(
+                        adapter.stream(parsed), parsed, adapter.name, timeline
+                    ):
                         yield frame
 
             return StreamingResponse(
@@ -152,7 +163,7 @@ def create_app(
             )
 
         async with track_inflight(adapter.name):
-            payload = await collect(adapter.stream(parsed), parsed, adapter.name)
+            payload = await collect(adapter.stream(parsed), parsed, adapter.name, timeline)
         return JSONResponse(payload)
 
     @app.get("/metrics")

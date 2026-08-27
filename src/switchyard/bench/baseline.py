@@ -1,119 +1,281 @@
 """Baseline experiment: what does the gateway cost when it does nothing?
 
 This is week one's deliverable and the reference point for everything after it.
-The gateway here is a passthrough -- no admission control, no queue, no cache --
-so the numbers it produces are the floor: the transport and pump cost that any
-scheduling policy has to be measured against.
+The gateway is a passthrough -- no admission control, no queue, no cache -- so
+the numbers are the floor: transport and pump cost that any scheduling policy
+has to be measured against.
 
-It runs the fleet and the gateway in-process so the whole experiment is one
-command with no container dependency, and so the run is reproducible from a
-fixed seed. That does mean the load generator shares an event loop with the
-system under test, which is called out in the report: at high offered load the
-generator's own scheduling lag is reported alongside the results precisely so a
-run contaminated by that is visible rather than silently wrong.
+Process isolation
+-----------------
+The fleet and the gateway run as separate subprocesses; the load generator runs
+here. That matters because an earlier version ran all three on one event loop,
+where the generator's own CPU work delayed the gateway it was measuring and the
+gateway's work delayed the generator's arrivals. Latency attributed to the
+system under test was partly the instrument's. Separate processes mean the
+generator can only contaminate a run by falling behind, which
+`generator_healthy` reports directly.
+
+Measurement window
+------------------
+Requests scheduled during warmup are issued but excluded from the statistics, so
+connection establishment and cold code paths do not land in the reported
+percentiles. Both counts are printed.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
+import os
+import socket
+import subprocess
+import sys
+import time
 from collections.abc import Sequence
 
-import uvicorn
+import httpx
 
-from switchyard.bench.loadgen import LoadSpec, run_load
+from switchyard.bench.loadgen import LoadSpec, run_load_detailed
 from switchyard.bench.plots import distribution, latency_vs_offered_load
 from switchyard.bench.stats import summarize, write_parquet
-from switchyard.synthetic.app import FleetState
-from switchyard.synthetic.app import create_app as create_fleet
-from switchyard.synthetic.profiles import DEFAULT_FLEET
 
 
-async def _serve(app, port: int) -> tuple[uvicorn.Server, asyncio.Task, int]:
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", access_log=False)
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
-    while not server.started:  # noqa: ASYNC110 - uvicorn readiness is a bool
-        await asyncio.sleep(0.01)
-    return server, task, server.servers[0].sockets[0].getsockname()[1]
+def free_port() -> int:
+    """Reserve a port by binding and releasing it.
+
+    Racy in principle; in practice the window is microseconds and the
+    alternative -- parsing a port out of a subprocess's log output -- is worse.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
 
-async def run(rates: Sequence[float], duration_s: float, model: str, seed: int,
-              max_tokens: int, out_dir: str, plot_dir: str) -> dict:
-    from switchyard.gateway.app import create_app as create_gateway
+class Service:
+    """A uvicorn subprocess."""
 
-    fleet_state = FleetState(dict(DEFAULT_FLEET), run_seed=seed)
-    fleet_srv, fleet_task, fleet_port = await _serve(create_fleet(fleet_state), 0)
-    gw_srv, gw_task, gw_port = await _serve(
-        create_gateway(fleet_url=f"http://127.0.0.1:{fleet_port}",
-                       providers=tuple(DEFAULT_FLEET)), 0
+    def __init__(self, app: str, port: int, env: dict[str, str] | None = None) -> None:
+        self.port = port
+        self.base_url = f"http://127.0.0.1:{port}"
+        self._proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "uvicorn", app,
+                "--host", "127.0.0.1", "--port", str(port),
+                "--log-level", "error", "--no-access-log",
+            ],
+            env={**os.environ, **(env or {})},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    async def wait_healthy(self, timeout_s: float = 30.0) -> None:
+        deadline = time.perf_counter() + timeout_s
+        async with httpx.AsyncClient(timeout=1.0) as c:
+            while time.perf_counter() < deadline:
+                if self._proc.poll() is not None:
+                    err = (self._proc.stderr.read().decode() if self._proc.stderr else "")
+                    raise RuntimeError(f"{self.base_url} exited during startup:\n{err}")
+                try:
+                    if (await c.get(f"{self.base_url}/health")).status_code == 200:
+                        return
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.05)
+        raise RuntimeError(f"{self.base_url} did not become healthy in {timeout_s}s")
+
+    def stop(self) -> None:
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait(timeout=5)
+
+
+def histogram_quantile(buckets: list[tuple[float, float]], q: float) -> float:
+    """Quantile from cumulative histogram buckets, interpolating within a bucket.
+
+    The same approach Prometheus uses. Resolution is limited by bucket width, so
+    a value is only as precise as the bucket it lands in -- which is why the
+    overhead buckets are dense below 10ms.
+    """
+    if not buckets or buckets[-1][1] == 0:
+        return float("nan")
+    target = q * buckets[-1][1]
+    prev_bound = prev_count = 0.0
+    for bound, count in buckets:
+        if count >= target:
+            if bound == float("inf"):
+                return prev_bound
+            span = count - prev_count
+            frac = (target - prev_count) / span if span else 0.0
+            return prev_bound + (bound - prev_bound) * frac
+        prev_bound, prev_count = bound, count
+    return buckets[-1][0]
+
+
+async def scrape_timing_decomposition(base_url: str) -> dict[str, float]:
+    """Read the gateway's own view of where request time went.
+
+    This is the honest way to state gateway overhead. Comparing a measured TTFT
+    against the fleet's configured median cannot work: provider TTFT variance is
+    far larger than the gateway's contribution, so the difference is noise.
+    Asking the gateway what it spent is a direct measurement instead of a
+    subtraction between two noisy numbers.
+
+    Both quantiles and exact means are reported. Histogram quantiles are limited
+    by bucket width -- a quantile that lands in the first bucket is reported at
+    its midpoint, so a metric whose observations are all exactly zero reads as
+    half the first bucket rather than zero. The mean, computed from the metric's
+    own sum and count, has no such artifact.
+    """
+    async with httpx.AsyncClient(timeout=5.0) as c:
+        text = (await c.get(f"{base_url}/metrics")).text
+
+    series: dict[str, list[tuple[float, float]]] = {}
+    totals: dict[str, float] = {}
+    counts: dict[str, float] = {}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        value_str = line.rsplit(" ", 1)[-1]
+        try:
+            value = float(value_str)
+        except ValueError:
+            continue
+        if "_bucket{" in line:
+            name = line.split("_bucket{", 1)[0]
+            le = line.split('le="', 1)[1].split('"', 1)[0]
+            bound = float("inf") if le == "+Inf" else float(le)
+            series.setdefault(name, []).append((bound, value))
+        elif "_sum" in line:
+            name = line.split("_sum", 1)[0]
+            totals[name] = totals.get(name, 0.0) + value
+        elif "_count" in line:
+            name = line.split("_count", 1)[0]
+            counts[name] = counts.get(name, 0.0) + value
+
+    out: dict[str, float] = {}
+    for metric in ("switchyard_gateway_overhead_seconds", "switchyard_provider_time_seconds",
+                   "switchyard_queue_wait_seconds"):
+        merged: dict[float, float] = {}
+        for bound, value in series.get(metric, []):
+            merged[bound] = merged.get(bound, 0.0) + value
+        buckets = sorted(merged.items())
+        short = metric.replace("switchyard_", "").replace("_seconds", "")
+        for q in (0.50, 0.95, 0.99):
+            out[f"{short}_p{int(q * 100)}_ms"] = histogram_quantile(buckets, q) * 1000
+        count = counts.get(metric, 0.0)
+        out[f"{short}_mean_ms"] = (totals.get(metric, 0.0) / count * 1000) if count else 0.0
+    return out
+
+
+async def run(
+    rates: Sequence[float], duration_s: float, warmup_s: float, model: str, seed: int,
+    max_tokens: int, max_connections: int, out_dir: str, plot_dir: str,
+) -> list[dict]:
+    fleet = Service("switchyard.synthetic.app:app", free_port())
+    gateway = Service(
+        "switchyard.gateway.app:app", free_port(),
+        env={"SWITCHYARD_FLEET_URL": fleet.base_url},
     )
-    url = f"http://127.0.0.1:{gw_port}/v1/chat/completions"
 
-    summaries, latency_samples, ttft_samples = [], {}, {}
+    summaries: list[dict] = []
+    latency_samples: dict[str, list[float]] = {}
+    ttft_samples: dict[str, list[float]] = {}
+
     try:
+        await fleet.wait_healthy()
+        await gateway.wait_healthy()
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            await c.put(f"{fleet.base_url}/control/seed", json={"run_seed": seed})
+
+        url = f"{gateway.base_url}/v1/chat/completions"
+        print(f"fleet={fleet.base_url}  gateway={gateway.base_url}  seed={seed}")
+        print(f"window: warmup {warmup_s:g}s discarded, measuring {warmup_s:g}-{duration_s:g}s\n")
+
         for rate in rates:
-            spec = LoadSpec(url=url, rate=rate, duration_s=duration_s, model=model,
-                            seed=seed, max_tokens=max_tokens)
-            records = await run_load(spec)
-            summary = summarize(records)
+            spec = LoadSpec(
+                url=url, rate=rate, duration_s=duration_s, model=model, seed=seed,
+                max_tokens=max_tokens, warmup_s=warmup_s, max_connections=max_connections,
+            )
+            outcome = await run_load_detailed(spec)
+            summary = summarize(outcome.records, outcome=outcome)
             summary["offered_rate"] = rate
             summaries.append(summary)
 
-            ok = [r for r in records if r.ok]
-            latency_samples[f"{rate:g} rps"] = [r.latency for r in ok if r.latency is not None]
-            ttft_samples[f"{rate:g} rps"] = [r.ttft for r in ok if r.ttft is not None]
+            measured = [r for r in outcome.records if r.in_window and r.ok]
+            latency_samples[f"{rate:g} rps"] = [
+                r.latency for r in measured if r.latency is not None
+            ]
+            ttft_samples[f"{rate:g} rps"] = [r.ttft for r in measured if r.ttft is not None]
 
-            write_parquet(records, f"{out_dir}/baseline_rate{rate:g}.parquet",
+            write_parquet(outcome.records, f"{out_dir}/baseline_rate{rate:g}.parquet",
                           label=f"baseline_rate{rate:g}", spec=spec)
-            flag = "" if summary["generator_kept_up"] else "  <-- GENERATOR LAGGED, run invalid"
+
             print(
-                f"rate={rate:>5g}  ok={summary['completed_ok']:>4}  "
+                f"rate={rate:>5g}  n={summary['requests_in_window']:>4}"
+                f"/{summary['requests_total']:<4}  "
                 f"p50={summary['latency_p50_ms']:>7.1f}ms  "
                 f"p99={summary['latency_p99_ms']:>8.1f}ms  "
                 f"ttft_p50={summary['ttft_p50_ms']:>6.1f}ms  "
-                f"lag_p99={summary['scheduling_lag_p99_ms']:>6.2f}ms{flag}"
+                f"lag={summary['scheduling_lag_ratio']:.3f}  "
+                f"peak_conc={summary['peak_concurrency']:>3}  "
+                f"{'ok' if summary['generator_healthy'] else 'GENERATOR UNHEALTHY'}"
             )
+            if not summary["generator_healthy"]:
+                for problem in summary["generator_problems"]:
+                    print(f"          ! {problem}")
+        decomposition = await scrape_timing_decomposition(gateway.base_url)
+        print("\ngateway's own timing decomposition (all rates pooled):")
+        for key, value in decomposition.items():
+            print(f"  {key:32} {value:8.3f} ms")
     finally:
-        for srv, task in ((gw_srv, gw_task), (fleet_srv, fleet_task)):
-            srv.should_exit = True
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(task, timeout=5)
+        gateway.stop()
+        fleet.stop()
 
-    lat = latency_vs_offered_load(
-        rates=[s["offered_rate"] for s in summaries],
-        p50=[s["latency_p50_ms"] / 1000 for s in summaries],
-        p95=[s["latency_p95_ms"] / 1000 for s in summaries],
-        p99=[s["latency_p99_ms"] / 1000 for s in summaries],
-        throughput=[s["throughput_rps"] for s in summaries],
-        goodput=[s["goodput_rps"] for s in summaries],
-        path=f"{plot_dir}/baseline_latency_vs_load.svg",
-    )
-    ttft_plot = distribution(ttft_samples, f"{plot_dir}/baseline_ttft_cdf.svg",
-                             xlabel="time to first token (ms)",
-                             title="Baseline TTFT by offered load")
-    lat_plot = distribution(latency_samples, f"{plot_dir}/baseline_latency_cdf.svg",
-                            xlabel="end-to-end latency (ms)",
-                            title="Baseline latency by offered load")
-    print(f"\nfigures: {lat}\n         {ttft_plot}\n         {lat_plot}")
-    return {"summaries": summaries}
+    paths = [
+        latency_vs_offered_load(
+            rates=[s["offered_rate"] for s in summaries],
+            p50=[s["latency_p50_ms"] / 1000 for s in summaries],
+            p95=[s["latency_p95_ms"] / 1000 for s in summaries],
+            p99=[s["latency_p99_ms"] / 1000 for s in summaries],
+            throughput=[s["throughput_rps"] for s in summaries],
+            goodput=[s["goodput_rps"] for s in summaries],
+            path=f"{plot_dir}/baseline_latency_vs_load.svg",
+        ),
+        distribution(ttft_samples, f"{plot_dir}/baseline_ttft_cdf.svg",
+                     xlabel="time to first token (ms)",
+                     title="Baseline TTFT by offered load"),
+        distribution(latency_samples, f"{plot_dir}/baseline_latency_cdf.svg",
+                     xlabel="end-to-end latency (ms)",
+                     title="Baseline latency by offered load"),
+    ]
+    print("\nfigures:")
+    for path in paths:
+        print(f"  {path}")
+    return summaries
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Baseline passthrough experiment")
     p.add_argument("--rates", default="2,5,10,20,40")
-    p.add_argument("--duration", type=float, default=10.0)
+    p.add_argument("--duration", type=float, default=12.0)
+    p.add_argument("--warmup", type=float, default=2.0,
+                   help="seconds of arrivals issued but excluded from statistics")
     p.add_argument("--model", default="fast")
     p.add_argument("--max-tokens", type=int, default=256)
+    p.add_argument("--max-connections", type=int, default=1000)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--out-dir", default="results")
     p.add_argument("--plot-dir", default="plots")
     args = p.parse_args(argv)
 
-    rates = [float(x) for x in args.rates.split(",")]
-    asyncio.run(run(rates, args.duration, args.model, args.seed,
-                    args.max_tokens, args.out_dir, args.plot_dir))
+    asyncio.run(run(
+        [float(x) for x in args.rates.split(",")], args.duration, args.warmup,
+        args.model, args.seed, args.max_tokens, args.max_connections,
+        args.out_dir, args.plot_dir,
+    ))
     return 0
 
 

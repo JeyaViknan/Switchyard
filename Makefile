@@ -23,8 +23,8 @@ check: lint typecheck test
 # reproduced by this target, it is not evidence.
 bench: bench-baseline
 
-bench-baseline:
-	$(PY) -m switchyard.bench.baseline --rates 2,5,10,20,40 --duration 10
+
+	$(PY) -m switchyard.bench.baseline --rates 2,5,10,20,40 --duration 12 --warmup 2
 
 up:
 	docker compose up --build -d

@@ -28,8 +28,6 @@ class FinishReason(enum.StrEnum):
     STOP = "stop"
     LENGTH = "length"
     PROVIDER_ERROR = "provider_error"
-    TRUNCATED = "truncated"
-    CLIENT_DISCONNECT = "client_disconnect"
 
 
 class ErrorClass(enum.StrEnum):
@@ -42,15 +40,13 @@ class ErrorClass(enum.StrEnum):
     everyone.
     """
 
-    CONNECT = "connect"            # could not establish a connection
-    TIMEOUT_TTFT = "timeout_ttft"  # connected, no first token in time
+    CONNECT = "connect"              # could not establish a connection
+    TIMEOUT_TTFT = "timeout_ttft"    # connected, no first token in time
     TIMEOUT_TOKEN = "timeout_token"  # stream stalled mid-flight
-    TIMEOUT_TOTAL = "timeout_total"
-    RATE_LIMITED = "rate_limited"  # 429
-    SERVER_ERROR = "server_error"  # 5xx
-    BAD_REQUEST = "bad_request"    # 4xx other than 429
-    MALFORMED = "malformed"        # 200, but the body did not parse
-    DISCONNECTED = "disconnected"  # connection reset mid-stream
+    RATE_LIMITED = "rate_limited"    # 429
+    SERVER_ERROR = "server_error"    # 5xx
+    BAD_REQUEST = "bad_request"      # 4xx other than 429
+    DISCONNECTED = "disconnected"    # stream ended without a terminal frame
 
     @property
     def retryable(self) -> bool:
@@ -132,16 +128,6 @@ class CompletionRequest:
     temperature: float
     stream: bool
     request_id: str
-
-    @property
-    def cacheable(self) -> bool:
-        """Whether this request is safe to serve from an exact cache.
-
-        Only deterministic requests qualify. Non-deterministic ones would make a
-        cache hit observably different from a live call, which is a correctness
-        problem rather than a performance one.
-        """
-        return self.temperature == 0.0
 
 
 class ProviderAdapter(Protocol):

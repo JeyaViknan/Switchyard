@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 if TYPE_CHECKING:
-    from switchyard.bench.loadgen import LoadSpec, RequestRecord
+    from switchyard.bench.loadgen import LoadSpec, RequestRecord, RunOutcome
 
 # A request is "good" if it completed successfully within this wall-clock budget.
 # Goodput rather than throughput is the headline number under overload: a system
@@ -30,13 +30,29 @@ def percentiles(values: Sequence[float], ps: Iterable[float] = (50, 95, 99)) -> 
     return {f"p{int(p)}": float(np.percentile(arr, p)) for p in ps}
 
 
-def summarize(records: Sequence[RequestRecord], slo_s: float = DEFAULT_SLO_S) -> dict[str, Any]:
+def summarize(
+    records: Sequence[RequestRecord],
+    slo_s: float = DEFAULT_SLO_S,
+    outcome: RunOutcome | None = None,
+) -> dict[str, Any]:
     """Human-readable run summary.
 
-    `scheduling_lag_p99` comes first because it decides whether the rest of the
-    numbers mean anything: if the generator could not fire on schedule, measured
-    latency understates real latency and the run is invalid.
+    Scope: statistics cover only requests with `in_window=True` -- those whose
+    scheduled arrival fell outside the warmup period. Warmup requests are issued
+    normally (so the system is warm) but excluded from the numbers, because the
+    first requests of a run pay for connection establishment and cold code paths
+    that the experiment is not trying to measure. `requests_total` and
+    `requests_in_window` report both counts so the exclusion is visible.
+
+    `generator_healthy` comes first because it decides whether anything else
+    here means what it says. It is judged as a ratio of lag to typical latency
+    rather than against a fixed threshold: 20ms of scheduling lag is negligible
+    against a 2s request and disqualifying against a 50ms one.
     """
+    from switchyard.bench.loadgen import LAG_RATIO_THRESHOLD
+
+    issued = len(records)
+    records = [r for r in records if r.in_window]
     total = len(records)
     ok = [r for r in records if r.ok]
     latencies = [r.latency for r in ok if r.latency is not None]
@@ -59,14 +75,41 @@ def summarize(records: Sequence[RequestRecord], slo_s: float = DEFAULT_SLO_S) ->
     lat = percentiles(latencies)
     ttft = percentiles(ttfts)
 
+    # Lag as a fraction of typical latency. Undefined without a latency sample,
+    # in which case the run cannot be judged and is not claimed healthy.
+    lag_ratio = (lag["p99"] / lat["p50"]) if latencies and lat["p50"] > 0 else float("nan")
+    connection_limited = bool(outcome.connection_limited) if outcome else False
+    healthy = bool(lag_ratio == lag_ratio and lag_ratio < LAG_RATIO_THRESHOLD)
+
+    reasons = []
+    if lag_ratio != lag_ratio:
+        reasons.append("no completed requests to judge lag against")
+    elif lag_ratio >= LAG_RATIO_THRESHOLD:
+        reasons.append(
+            f"scheduling lag p99 is {lag_ratio:.0%} of median latency "
+            f"(threshold {LAG_RATIO_THRESHOLD:.0%}): the generator could not "
+            f"fire on schedule, so measured latency understates the truth"
+        )
+    if connection_limited:
+        healthy = False
+        reasons.append(
+            f"peak concurrency {outcome.peak_concurrency} reached the client "
+            f"connection cap: arrivals blocked on the pool, so the run was no "
+            f"longer open-loop"
+        )
+
     return {
-        "requests": total,
+        "requests_total": issued,
+        "requests_in_window": total,
         "completed_ok": len(ok),
         "error_rate": round(1 - len(ok) / total, 4) if total else 0.0,
         "errors": errors or "-",
         "scheduling_lag_p50_ms": round(lag["p50"] * 1000, 2),
         "scheduling_lag_p99_ms": round(lag["p99"] * 1000, 2),
-        "generator_kept_up": lag["p99"] < 0.05,
+        "scheduling_lag_ratio": round(lag_ratio, 4) if lag_ratio == lag_ratio else None,
+        "peak_concurrency": outcome.peak_concurrency if outcome else None,
+        "generator_healthy": healthy,
+        "generator_problems": reasons or "-",
         "throughput_rps": round(len(ok) / span, 2) if span else 0.0,
         "goodput_rps": round(len(good) / span, 2) if span else 0.0,
         "latency_p50_ms": round(lat["p50"] * 1000, 1),

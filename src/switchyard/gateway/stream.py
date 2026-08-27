@@ -19,9 +19,10 @@ from collections.abc import AsyncIterator
 
 import orjson
 
-from switchyard.obs.metrics import StreamTimer
+from switchyard.obs.metrics import RequestTimeline
 from switchyard.types import (
     CompletionRequest,
+    FinishReason,
     StreamDone,
     StreamEvent,
     StreamFailed,
@@ -44,21 +45,28 @@ def _frame(request: CompletionRequest, created: int, delta: dict, **extra) -> by
 
 
 async def to_sse(
-    events: AsyncIterator[StreamEvent], request: CompletionRequest, provider: str
+    events: AsyncIterator[StreamEvent], request: CompletionRequest, provider: str,
+    timeline: RequestTimeline,
 ) -> AsyncIterator[bytes]:
-    """Forward normalized events to the client as SSE, always terminating cleanly."""
+    """Forward normalized events to the client as SSE, always terminating cleanly.
+
+    The timeline is created at request arrival and passed in rather than started
+    here, so that everything before dispatch -- and, once admission control
+    exists, queue wait -- is inside the measured span.
+    """
     created = int(time.time())
-    timer = StreamTimer()
     outcome = "error"
+    timeline.mark_dispatched()
 
     try:
         async for event in events:
             if isinstance(event, TokenChunk):
-                timer.on_token(provider)
+                timeline.on_token(provider)
                 yield _frame(request, created, {"content": event.text})
 
             elif isinstance(event, StreamDone):
                 outcome = "ok"
+                timeline.mark_provider_done()
                 yield _frame(
                     request, created, {},
                     finish_reason=event.finish_reason.value,
@@ -72,12 +80,13 @@ async def to_sse(
 
             elif isinstance(event, StreamFailed):
                 outcome = f"error_{event.error_class.value}"
+                timeline.mark_provider_done()
                 # An explicit, typed terminal frame rather than a dropped
                 # connection. `tokens_emitted` tells the client exactly how much
                 # of the response it actually received.
                 yield _frame(
                     request, created, {},
-                    finish_reason="provider_error",
+                    finish_reason=FinishReason.PROVIDER_ERROR.value,
                     error={
                         "type": event.error_class.value,
                         "message": event.message,
@@ -87,11 +96,12 @@ async def to_sse(
                 )
                 yield b"data: [DONE]\n\n"
     finally:
-        timer.finish(request.model, provider, outcome)
+        timeline.finish(request.model, provider, outcome)
 
 
 async def collect(
-    events: AsyncIterator[StreamEvent], request: CompletionRequest, provider: str
+    events: AsyncIterator[StreamEvent], request: CompletionRequest, provider: str,
+    timeline: RequestTimeline,
 ) -> dict:
     """Assemble a non-streaming response from the same stream.
 
@@ -100,20 +110,21 @@ async def collect(
     a response shape the client could have assembled itself.
     """
     created = int(time.time())
-    timer = StreamTimer()
     parts: list[str] = []
     terminal: StreamDone | StreamFailed | None = None
+    timeline.mark_dispatched()
 
     try:
         async for event in events:
             if isinstance(event, TokenChunk):
-                timer.on_token(provider)
+                timeline.on_token(provider)
                 parts.append(event.text)
             else:
                 terminal = event
+                timeline.mark_provider_done()
     finally:
         outcome = "ok" if isinstance(terminal, StreamDone) else "error"
-        timer.finish(request.model, provider, outcome)
+        timeline.finish(request.model, provider, outcome)
 
     text = "".join(parts)
     if isinstance(terminal, StreamDone):
@@ -122,7 +133,7 @@ async def collect(
         error = None
     else:
         usage = terminal.usage if terminal and terminal.usage else None
-        finish_reason = "provider_error"
+        finish_reason = FinishReason.PROVIDER_ERROR.value
         error = {
             "type": terminal.error_class.value if terminal else "unknown",
             "message": terminal.message if terminal else "stream produced no terminal event",

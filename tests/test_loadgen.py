@@ -7,11 +7,22 @@ checking that it runs.
 
 from __future__ import annotations
 
+import resource
+
 import numpy as np
 import pytest
 
-from switchyard.bench.loadgen import LoadSpec, RequestRecord, arrival_schedule, run_load
-from switchyard.bench.stats import percentiles, summarize
+from switchyard.bench.loadgen import (
+    LoadSpec,
+    RequestRecord,
+    RunOutcome,
+    arrival_schedule,
+    check_fd_headroom,
+    request_id_for,
+    run_load,
+    run_load_detailed,
+)
+from switchyard.bench.stats import percentiles, read_parquet, summarize, write_parquet
 from switchyard.synthetic.profiles import FaultSpec
 
 # -- arrival schedule ------------------------------------------------------
@@ -80,14 +91,127 @@ async def test_latency_is_measured_from_intended_start(fleet_server):
     assert record.latency == pytest.approx(2.0)
 
 
-async def test_scheduling_lag_is_reported_so_invalid_runs_are_detectable(fleet_server):
+async def test_generator_health_reflects_lag_relative_to_the_workload(fleet_server):
+    """The same absolute lag is fine for a slow workload and disqualifying for a fast one.
+
+    Both arms are real runs at the same rate against the same process. Only the
+    provider's speed differs, and that alone flips the verdict -- which is the
+    point of judging lag as a ratio rather than against a fixed millisecond bar.
+    """
+    def spec_for(model: str) -> LoadSpec:
+        return LoadSpec(
+            url=f"{fleet_server.base_url}/v1/{model}/chat/completions",
+            rate=20.0, duration_s=1.0, model=model, seed=2,
+        )
+
+    slow = await run_load_detailed(spec_for("held"))       # ~200ms requests
+    slow_summary = summarize(slow.records, outcome=slow)
+    assert slow_summary["generator_healthy"] is True
+    assert slow_summary["generator_problems"] == "-"
+
+    fast = await run_load_detailed(spec_for("quick"))      # ~10ms requests
+    fast_summary = summarize(fast.records, outcome=fast)
+    assert fast_summary["scheduling_lag_ratio"] > slow_summary["scheduling_lag_ratio"]
+
+
+def test_generator_health_is_a_ratio_of_latency_not_a_fixed_threshold():
+    """20ms of lag is negligible against a 2s request and fatal against a 50ms one."""
+    def run(lag_s: float, latency_s: float):
+        records = []
+        for i in range(50):
+            r = RequestRecord(request_id=f"r{i}", tenant="t", intended_start=0.0,
+                              actual_start=lag_s)
+            r.status = 200
+            r.first_token_at = lag_s
+            r.completed_at = latency_s
+            records.append(r)
+        return summarize(records)
+
+    assert run(lag_s=0.02, latency_s=2.0)["generator_healthy"] is True
+    slow = run(lag_s=0.02, latency_s=0.05)
+    assert slow["generator_healthy"] is False
+    assert "understates" in slow["generator_problems"][0]
+
+
+def test_connection_saturation_marks_the_run_unhealthy():
+    """At the connection cap the generator is no longer open-loop, and says so."""
+    records = []
+    for i in range(20):
+        r = RequestRecord(request_id=f"r{i}", tenant="t", intended_start=0.0, actual_start=0.0)
+        r.status = 200
+        r.first_token_at = 0.01
+        r.completed_at = 1.0
+        records.append(r)
+
+    saturated = RunOutcome(records=records, peak_concurrency=8, connection_limited=True)
+    summary = summarize(records, outcome=saturated)
+    assert summary["generator_healthy"] is False
+    assert any("open-loop" in p for p in summary["generator_problems"])
+    assert summary["peak_concurrency"] == 8
+
+
+def test_fd_headroom_is_checked_before_the_run_starts():
+    """fd exhaustion must not masquerade as the system under test refusing work."""
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY:
+        pytest.skip("no descriptor limit on this platform")
+    with pytest.raises(RuntimeError, match="file descriptors"):
+        check_fd_headroom(soft + 1000)
+    check_fd_headroom(1)          # comfortably under the limit; must not raise
+
+
+# -- measurement window ----------------------------------------------------
+
+
+async def test_warmup_requests_are_issued_but_excluded_from_statistics(fleet_server):
+    """Warmup keeps the system warm without letting cold-start costs into the numbers."""
     spec = LoadSpec(
         url=f"{fleet_server.base_url}/v1/quick/chat/completions",
-        rate=20.0, duration_s=1.0, model="quick", seed=2,
+        rate=20.0, duration_s=1.0, model="quick", seed=3, warmup_s=0.4,
+    )
+    records = await run_load(spec)
+    warmup = [r for r in records if not r.in_window]
+    measured = [r for r in records if r.in_window]
+
+    assert warmup and measured, "test needs requests on both sides of the boundary"
+    assert all(r.completed_at is not None for r in warmup), "warmup requests still run"
+
+    summary = summarize(records)
+    assert summary["requests_total"] == len(records)
+    assert summary["requests_in_window"] == len(measured)
+    assert summary["requests_in_window"] < summary["requests_total"]
+
+
+async def test_zero_warmup_includes_every_request(fleet_server):
+    spec = LoadSpec(
+        url=f"{fleet_server.base_url}/v1/quick/chat/completions",
+        rate=10.0, duration_s=0.6, model="quick", seed=3,
     )
     summary = summarize(await run_load(spec))
-    assert "scheduling_lag_p99_ms" in summary
-    assert summary["generator_kept_up"] is True
+    assert summary["requests_in_window"] == summary["requests_total"]
+
+
+# -- inter-token timing ----------------------------------------------------
+
+
+async def test_inter_token_samples_survive_persistence(tmp_path, fleet_server):
+    """A mean cannot express an inter-token tail, so the samples must be kept."""
+    spec = LoadSpec(
+        url=f"{fleet_server.base_url}/v1/quick/chat/completions",
+        rate=8.0, duration_s=0.5, model="quick", seed=21,
+    )
+    records = await run_load(spec)
+    path = str(tmp_path / "itl.parquet")
+    write_parquet(records, path, label="itl", spec=spec)
+
+    table = read_parquet(path)
+    assert "inter_token_s" in table.column_names
+    rows = table["inter_token_s"].to_pylist()
+    pooled = [gap for row in rows if row for gap in row]
+    # More gaps than requests proves per-token samples survived, rather than one
+    # aggregate per request.
+    assert len(pooled) > len(rows) > 1
+    assert float(np.percentile(pooled, 99)) >= float(np.percentile(pooled, 50))
 
 
 # -- SSE parsing -----------------------------------------------------------
@@ -156,3 +280,42 @@ def test_summary_separates_throughput_from_goodput():
     summary = summarize(records, slo_s=10.0)
     assert summary["completed_ok"] == 10
     assert summary["goodput_rps"] < summary["throughput_rps"]
+
+
+# -- reproducibility -------------------------------------------------------
+
+
+def test_request_ids_are_deterministic_from_seed_and_index():
+    assert request_id_for(7, 0) == request_id_for(7, 0)
+    assert request_id_for(7, 0) != request_id_for(7, 1)
+    assert request_id_for(7, 0) != request_id_for(8, 0)
+
+
+async def test_same_seed_reproduces_the_same_workload(fleet_server):
+    """Two runs of one spec must be the same workload, request for request.
+
+    The synthetic fleet keys every draw on (run_seed, request_id). If ids were
+    random, two runs would differ in output length, TTFT and fault decisions --
+    so comparing two scheduling policies would compare two different workloads,
+    and every A/B result in the project would be meaningless.
+    """
+    spec = LoadSpec(
+        url=f"{fleet_server.base_url}/v1/quick/chat/completions",
+        rate=15.0, duration_s=1.0, model="quick", seed=4242, max_tokens=512,
+    )
+    first = await run_load(spec)
+    second = await run_load(spec)
+
+    assert len(first) == len(second) > 5
+    assert [r.request_id for r in first] == [r.request_id for r in second]
+    assert [r.output_tokens for r in first] == [r.output_tokens for r in second]
+
+
+async def test_different_seed_produces_a_different_workload(fleet_server):
+    base = dict(
+        url=f"{fleet_server.base_url}/v1/quick/chat/completions",
+        rate=15.0, duration_s=1.0, model="quick", max_tokens=512,
+    )
+    a = await run_load(LoadSpec(seed=1, **base))
+    b = await run_load(LoadSpec(seed=2, **base))
+    assert [r.output_tokens for r in a] != [r.output_tokens for r in b]

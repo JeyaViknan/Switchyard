@@ -34,9 +34,9 @@ one written first is shaped by the question being asked.
 | Component | State |
 |---|---|
 | Synthetic provider fleet | Done — deterministic, runtime fault injection |
-| Open-loop load generator | Done — Poisson arrivals, SSE-aware, TTFT/ITL capture |
+| Open-loop load generator | Done — Poisson arrivals, SSE-aware, per-token timing persisted |
 | Gateway | Passthrough only — no auth, limits, cache, or scheduler yet |
-| Baseline measurement | Done — see `plots/` |
+| Baseline measurement | Done — latency floor only, no saturation knee |
 | Admission control + DRR scheduler | Week 2 |
 | Capacity accounting, reliability | Week 3 |
 | Semantic-cache experiment, report | Week 4 |
@@ -55,8 +55,25 @@ request at its scheduled time regardless of whether earlier ones have finished.
 Every latency is measured from the request's *intended* start.
 
 An open-loop generator can itself become the bottleneck, so every run reports
-`scheduling_lag` — how late it fired. If that grows, the run is invalid and says
-so. That self-check is what makes the rest of the numbers credible.
+its own health:
+
+- **Scheduling lag** — how late each request actually fired, judged as a *ratio*
+  of median latency rather than a fixed millisecond bar. 20 ms of lag is
+  negligible against a 2 s request and disqualifying against a 50 ms one.
+- **Connection saturation** — if concurrency reaches the client's connection
+  cap, arrivals block on the pool and the run has silently stopped being
+  open-loop.
+- **File-descriptor headroom** — checked before the run starts, so fd exhaustion
+  cannot masquerade as the system under test refusing connections.
+
+The fleet, the gateway, and the generator run in **separate processes**. An
+earlier version ran all three on one event loop, where the generator's own CPU
+work delayed the gateway it was measuring; scheduling lag reached 20 ms at only
+20 rps. With process isolation the same measurement runs at 0.0–2.5% of median
+latency through 40 rps.
+
+Requests scheduled during warmup are issued but excluded from the statistics, so
+connection setup and cold code paths do not land in the reported percentiles.
 
 ## Why a synthetic provider fleet
 
@@ -67,28 +84,69 @@ money per run, and rate-limit exactly when throughput is needed.
 
 The fleet draws every per-request decision — time to first token, output length,
 whether this request fails and how — from an RNG seeded by
-`(run_seed, request_id)`. Replaying a workload under a different scheduler
-reproduces the same provider behavior request for request. Faults are driven at
-runtime through `/control/*`, so a benchmark can inject a provider outage
-mid-run and measure the recovery timeline.
+`(run_seed, request_id)`, and the load generator derives request ids from
+`(seed, index)` rather than randomly. Both halves are required: with random ids
+the fleet is deterministic but the workload is not, and two runs of one spec
+produce different output lengths. `test_same_seed_reproduces_the_same_workload`
+asserts that two runs return identical per-request output tokens.
+
+Faults are driven at runtime through `/control/*`, so a benchmark can inject a
+provider outage mid-run. Enabling a fault does not perturb the other draws, so a
+faulted run remains comparable to a clean one; that property is also tested.
 
 ## Baseline
 
-The gateway is currently a passthrough, so the baseline is the latency floor —
-transport and pump cost with no scheduling in the path.
+The gateway is currently a passthrough, so this measures the latency floor:
+transport and pump cost with no scheduling in the path. Single run per rate,
+seed 1, 12 s each with the first 2 s discarded as warmup.
 
 ```
-rate=    2  ok=  11  p50= 2057ms  p99= 3369ms  ttft_p50= 259ms  lag_p99=  1.66ms
-rate=    5  ok=  28  p50= 2315ms  p99= 3483ms  ttft_p50= 225ms  lag_p99=  1.32ms
-rate=   10  ok=  49  p50= 2354ms  p99= 3440ms  ttft_p50= 231ms  lag_p99= 10.10ms
-rate=   20  ok= 116  p50= 2015ms  p99= 3451ms  ttft_p50= 237ms  lag_p99= 19.75ms
+rate=    2  n=  20/22    p50= 2384.9ms  p99= 3298.9ms  ttft_p50= 239.8ms  lag=0.001  peak_conc=  9
+rate=    5  n=  42/49    p50= 2318.4ms  p99= 3355.3ms  ttft_p50= 231.4ms  lag=0.025  peak_conc= 15
+rate=   10  n=  96/116   p50= 1993.4ms  p99= 3354.4ms  ttft_p50= 218.4ms  lag=0.001  peak_conc= 29
+rate=   20  n= 209/239   p50= 2074.3ms  p99= 3349.2ms  ttft_p50= 219.2ms  lag=0.000  peak_conc= 51
+rate=   40  n= 416/486   p50= 2173.8ms  p99= 3403.0ms  ttft_p50= 220.3ms  lag=0.007  peak_conc=105
 ```
 
-TTFT p50 of ~230 ms against a configured provider median of 220 ms: the gateway
-adds close to nothing. Latency is flat across offered load and throughput tracks
-it linearly, which is the expected shape — an unconstrained passthrough has no
-concurrency limit, so nothing queues. The knee appears once there is a scheduler
-to produce one.
+`n` is requests in the measurement window over requests issued; `lag` is p99
+scheduling lag as a fraction of median latency.
+
+### How much of that is the gateway?
+
+Measured directly from the gateway's own timing decomposition, pooled across all
+rates above:
+
+```
+gateway_overhead   p50   0.88ms   p95   2.41ms   p99   4.72ms   mean   1.07ms
+provider_time      p50 2123ms     p95 3812ms     p99 3962ms     mean 2169ms
+queue_wait         mean 0.000ms   (structurally zero: no admission control yet)
+```
+
+So the gateway accounts for roughly **0.05% of median request time** at these
+settings. This is a direct measurement, not an inference. An earlier version of
+this README compared measured TTFT against the fleet's *configured* TTFT median
+and concluded the gateway "adds close to nothing" — that method does not work.
+Provider TTFT variance (lognormal, σ=0.4) is far larger than the gateway's
+contribution, and running the comparison properly returned **−14 ms**, which is
+impossible and simply means the signal was below the noise floor. Asking the
+gateway what it spent replaces a subtraction of two noisy numbers with one
+measurement.
+
+### What this baseline does not establish
+
+- **No saturation point.** Latency is flat and throughput linear across 2–40 rps
+  because nothing in the passthrough constrains concurrency — peak concurrency
+  only reached 105. Flatness here is a property of the load range, not a
+  finding. There is no knee because there is nothing yet to produce one.
+- **Single run per rate.** No repeats, so no confidence interval. The plan calls
+  for median-of-5; that arrives with the overload experiment.
+- **Short window.** 10 s of measured arrivals per rate. Enough for a floor,
+  not enough for tail behavior at p99.9.
+- **One machine, unpinned.** No CPU isolation; other load on the host will show
+  up in the numbers.
+
+The overload experiment will need much higher offered load, repeats, and a knee.
+None of that is claimed here.
 
 ## Running it
 
