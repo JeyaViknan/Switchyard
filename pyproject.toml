@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "switchyard"
+version = "0.1.0"
+description = "Admission control and fair scheduling for LLM inference capacity under output-length uncertainty"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",   # pulls uvloop + httptools; see docs/decisions.md
+    "httpx",
+    "prometheus-client",
+    "orjson",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# Analysis is only needed to turn benchmark runs into figures. Kept out of the
+# gateway's runtime deps so the service image stays small.
+bench = ["pyarrow", "matplotlib"]
+dev = ["pytest", "pytest-asyncio", "hypothesis", "ruff", "mypy"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/switchyard"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+
+# Strict only where correctness is load-bearing. The scheduler, limiter, and
+# accounting code get full strictness; benchmark tooling and the synthetic
+# provider do not, because they are instruments rather than the system.
+[[tool.mypy.overrides]]
+module = ["switchyard.adapters.*"]
+disallow_untyped_defs = true
+strict_equality = true

@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: switchyard
+    folder: Switchyard
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -e ".[dev,bench]"
+      - run: ruff check src tests
+      - run: mypy src/switchyard/adapters src/switchyard/types.py
+      - run: pytest -q
+
+  # The benchmark suite is not run on every push: it needs a quiet machine to
+  # produce meaningful latency numbers, and a shared CI runner is not that.
+  # Run manually to regenerate figures; the numbers in the report come from a
+  # controlled environment, not from here.
+  bench:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -e ".[dev,bench]"
+      - run: make bench-baseline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-figures
+          path: plots/

@@ -1,0 +1,62 @@
+# The whole system, plus the instruments used to measure it.
+#
+# `--http httptools --loop uvloop` is explicit rather than left to uvicorn's
+# auto-detection so the container and local runs use the same event loop and
+# HTTP parser; a benchmark comparing the two would otherwise be comparing
+# runtimes as much as code.
+
+services:
+  fleet:
+    build: .
+    command: >
+      uvicorn switchyard.synthetic.app:app --host 0.0.0.0 --port 8100
+      --loop uvloop --http httptools --no-access-log
+    ports: ["8100:8100"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build: .
+    command: >
+      uvicorn switchyard.gateway.app:app --host 0.0.0.0 --port 8000
+      --loop uvloop --http httptools --no-access-log
+    environment:
+      SWITCHYARD_FLEET_URL: http://fleet:8100
+    ports: ["8000:8000"]
+    depends_on:
+      fleet: {condition: service_healthy}
+
+  # Staged for the tenancy and accounting work. Nothing connects to these yet;
+  # they are here so the stack does not change shape mid-project.
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    ports: ["6379:6379"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: switchyard
+      POSTGRES_USER: switchyard
+      POSTGRES_DB: switchyard
+    ports: ["5432:5432"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]

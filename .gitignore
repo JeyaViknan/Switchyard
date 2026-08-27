@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Claude Code machine-local settings (permissions etc.)
+.claude/settings.local.json
+
+# Benchmark artifacts: raw runs are reproducible via `make bench`, so they are
+# not tracked. Committed figures live in plots/ and are added explicitly.
+results/*.parquet
+results/*.json
+
+# OS
+.DS_Store
