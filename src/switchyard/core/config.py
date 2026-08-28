@@ -253,3 +253,64 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> GatewayConfig:
     config = GatewayConfig(tenants=tenants, **gateway_raw)
     config.validate()
     return config
+
+
+def render_toml(config: GatewayConfig) -> str:
+    """Serialise a configuration back to TOML.
+
+    Used to run a copy of someone's configuration with test credentials
+    substituted: `switchyard verify` needs raw keys to send traffic, and a
+    configuration only stores digests. Everything that defines behaviour --
+    capacity, weights, floors, ceilings, budgets, routes, timeouts, breaker
+    settings -- is carried across unchanged, because those are the subject of
+    the verification.
+    """
+    lines = [
+        "[gateway]",
+        f"max_concurrency = {config.max_concurrency}",
+        f'scheduling_policy = "{config.scheduling_policy}"',
+        f"drain_timeout_s = {config.drain_timeout_s}",
+        "providers = [" + ", ".join(f'"{p}"' for p in config.providers) + "]",
+    ]
+    if config.admin_key_sha256:
+        lines.append(f'admin_key_sha256 = "{config.admin_key_sha256}"')
+    lines += [
+        "",
+        "[timeouts]",
+        f"connect_s = {config.timeouts.connect_s}",
+        f"ttft_s = {config.timeouts.ttft_s}",
+        f"inter_token_s = {config.timeouts.inter_token_s}",
+        f"total_s = {config.timeouts.total_s}",
+        "",
+        "[breaker]",
+        f"failure_threshold = {config.breaker.failure_threshold}",
+        f"min_samples = {config.breaker.min_samples}",
+        f"window = {config.breaker.window}",
+        f"cooldown_s = {config.breaker.cooldown_s}",
+        f"max_cooldown_s = {config.breaker.max_cooldown_s}",
+        f"jitter = {config.breaker.jitter}",
+        f"half_open_probes = {config.breaker.half_open_probes}",
+        "",
+    ]
+    if config.routes:
+        lines.append("[routes]")
+        for model, candidates in config.routes.items():
+            lines.append(f"{model} = [" + ", ".join(f'"{c}"' for c in candidates) + "]")
+        lines.append("")
+    for t in config.tenants:
+        lines += [
+            "[[tenants]]",
+            f'id = "{t.id}"',
+            f'key_sha256 = "{t.key_sha256}"',
+            f"weight = {t.weight}",
+            f"reserved_concurrency = {t.reserved_concurrency}",
+            f"max_queue_depth = {t.max_queue_depth}",
+            f"deadline_s = {t.deadline_s}",
+            f"max_tokens_cap = {t.max_tokens_cap}",
+        ]
+        if t.max_concurrency is not None:
+            lines.append(f"max_concurrency = {t.max_concurrency}")
+        if t.budget_tokens is not None:
+            lines.append(f"budget_tokens = {t.budget_tokens}")
+        lines.append("")
+    return "\n".join(lines)

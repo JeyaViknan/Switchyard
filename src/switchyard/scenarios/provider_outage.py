@@ -194,29 +194,29 @@ async def run(reporter: Reporter, capacity: int = 8, healthy_s: float = 8.0,
     errors = summarise_rejections(during)
 
     return ScenarioResult(NAME, [
-        Check(
+        Check.result(
             "clients kept getting answers during the outage", survived,
             f"{pct(ok_during, n_during):.0f}% served "
             f"({', '.join(f'{k} {v}' for k, v in errors.items()) or 'no failures'})",
             "requests failed while the primary provider was down",
         ),
-        Check(
+        Check.result(
             "traffic moved to the fallback provider", breaker_reacted,
             f"{failovers} failovers, {int(final_health[PRIMARY]['failures'])} "
             f"failures recorded against '{PRIMARY}'",
             "the gateway did not route around the failing provider",
         ),
-        Check(
+        Check.result(
             "stopped calling the failing provider", stopped_calling,
             f"{skipped} requests skipped '{PRIMARY}' while its breaker was open",
             "every request kept paying to rediscover the outage",
         ),
-        Check(
+        Check.result(
             "service recovered after the provider did", recovered,
             f"{pct(ok_after, n_after):.0f}% served after recovery",
             "the gateway did not resume normal service",
         ),
-        Check(
+        Check.result(
             "no capacity leaked", no_leak,
             f"{final_stats['inflight']} in flight, "
             f"{final_stats['queue_depth']} queued at rest",

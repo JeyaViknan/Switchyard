@@ -22,6 +22,7 @@ from switchyard.core.config import load_config
 from switchyard.scenarios import SCENARIOS, names
 from switchyard.scenarios.base import (
     Check,
+    Outcome,
     Reporter,
     ScenarioResult,
     TenantSpec,
@@ -43,29 +44,41 @@ def reporter() -> tuple[Reporter, io.StringIO]:
 
 
 def test_a_result_passes_only_when_every_check_passes():
-    ok = ScenarioResult("s", [Check("a", True, ""), Check("b", True, "")])
-    bad = ScenarioResult("s", [Check("a", True, ""), Check("b", False, "")])
+    ok = ScenarioResult("s", [Check.result("a", True, ""), Check.result("b", True, "")])
+    bad = ScenarioResult("s", [Check.result("a", True, ""), Check.result("b", False, "")])
     assert ok.passed and ok.exit_code == 0
     assert not bad.passed and bad.exit_code == 1
+
+
+def test_a_skipped_check_does_not_fail_the_run():
+    """It was not checked, which is different from being checked and found wanting."""
+    result = ScenarioResult("s", [
+        Check.result("a", True, "1.0"),
+        Check.skip("b", "only one tenant configured"),
+    ])
+    assert result.passed and result.exit_code == 0
+    assert result.checks[1].outcome is Outcome.SKIP
 
 
 def test_verdict_shows_the_measured_detail_for_every_check():
     rep, buf = reporter()
     rep.verdict(ScenarioResult("s", [
-        Check("isolation held", True, "queue wait p95 41ms"),
-        Check("nothing leaked", False, "3 in flight", "capacity was still held"),
+        Check.result("isolation held", True, "queue wait p95 41ms"),
+        Check.result("nothing leaked", False, "3 in flight", "capacity was still held",
+                     "raise gateway.max_concurrency"),
     ]))
     out = buf.getvalue()
     assert "PASS  isolation held" in out
     assert "FAIL  nothing leaked" in out
     assert "queue wait p95 41ms" in out
     assert "capacity was still held" in out, "a failure should explain itself"
+    assert "-> raise gateway.max_concurrency" in out, "a failure should be actionable"
     assert "1 guarantee(s) did not hold." in out
 
 
 def test_a_passing_verdict_says_so():
     rep, buf = reporter()
-    rep.verdict(ScenarioResult("s", [Check("a", True, "1.0")]))
+    rep.verdict(ScenarioResult("s", [Check.result("a", True, "1.0")]))
     assert "All guarantees held." in buf.getvalue()
 
 

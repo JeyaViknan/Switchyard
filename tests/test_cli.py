@@ -149,27 +149,44 @@ def test_parser_exposes_the_product_commands():
         assert parser.parse_args(argv).func is not None
 
 
-def test_check_reports_an_invalid_config_without_a_traceback(tmp_path, capsys):
+def test_check_reports_an_unloadable_config_without_a_traceback(tmp_path, capsys):
+    """Exit 2 for a config that cannot load, distinct from 1 for one that loads badly."""
     bad = tmp_path / "bad.toml"
     bad.write_text("[gateway]\nmax_concurrency = 0\n")
-    assert main(["check", "--config", str(bad)]) == 1
-    assert "invalid" in capsys.readouterr().err
+    assert main(["check", "--config", str(bad)]) == 2
+    assert "not valid" in capsys.readouterr().err
 
 
-def test_check_summarises_a_valid_config(capsys):
+def test_check_passes_and_explains_a_valid_config(capsys):
     assert main(["check", "--config", "switchyard.toml"]) == 0
     out = capsys.readouterr().out
-    assert "is valid" in out and "acme" in out and "fast then slow" in out
+    assert "Configuration is valid." in out
+    assert "PASS" in out and "tenant 'acme'" in out
+    assert "falls back to slow" in out, "it should say what the routes actually do"
+    assert "switchyard verify" in out, "and point at the next step"
 
 
-def test_check_warns_when_operational_endpoints_would_be_disabled(tmp_path, capsys):
+def test_check_fails_when_operational_endpoints_would_be_disabled(tmp_path, capsys):
+    """A config that loads but leaves metrics and drain unreachable is a problem."""
     config = tmp_path / "c.toml"
     config.write_text(
         '[gateway]\nmax_concurrency = 4\n\n[[tenants]]\nid = "t1"\n'
         f'key_sha256 = "{"a" * 64}"\n'
     )
-    assert main(["check", "--config", str(config)]) == 0
-    assert "admin_key_sha256" in capsys.readouterr().out
+    assert main(["check", "--config", str(config)]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL" in out and "admin_key_sha256" in out
+    assert "problem(s) to fix" in out
+
+
+def test_check_needs_no_running_services(capsys):
+    """It is the command you run constantly, so it must not start anything."""
+    import time
+
+    started = time.perf_counter()
+    main(["check", "--config", "switchyard.toml"])
+    capsys.readouterr()
+    assert time.perf_counter() - started < 1.0
 
 
 def test_keys_mint_prints_a_key_and_its_digest(capsys):

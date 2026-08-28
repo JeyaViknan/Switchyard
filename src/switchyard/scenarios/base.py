@@ -13,6 +13,7 @@ than a live table would.
 
 from __future__ import annotations
 
+import enum
 import sys
 import time
 from collections.abc import Sequence
@@ -21,14 +22,44 @@ from dataclasses import dataclass, field
 from switchyard.cli.render import Style
 
 
+class Outcome(enum.StrEnum):
+    """Three states, not two.
+
+    SKIP is load-bearing. A configuration with one tenant cannot be checked for
+    isolation between tenants, and reporting that as a pass would be a lie while
+    reporting it as a failure would be worse. Saying plainly that the check does
+    not apply, and why, is the only honest option -- and it often points at the
+    configuration gap that matters.
+    """
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+    SKIP = "SKIP"
+
+
 @dataclass(frozen=True, slots=True)
 class Check:
-    """One guarantee, and whether this run upheld it."""
+    """One guarantee, and what this run found."""
 
     name: str
-    passed: bool
+    outcome: Outcome
     detail: str
     explain: str = ""
+    recommendation: str = ""
+
+    @property
+    def passed(self) -> bool:
+        """A skipped check does not fail the run; it was not checked."""
+        return self.outcome is not Outcome.FAIL
+
+    @classmethod
+    def result(cls, name: str, ok: bool, detail: str, explain: str = "",
+               recommendation: str = "") -> Check:
+        return cls(name, Outcome.PASS if ok else Outcome.FAIL, detail, explain, recommendation)
+
+    @classmethod
+    def skip(cls, name: str, why: str, recommendation: str = "") -> Check:
+        return cls(name, Outcome.SKIP, why, recommendation=recommendation)
 
 
 @dataclass(slots=True)
@@ -82,19 +113,37 @@ class Reporter:
     def status(self, text: str) -> None:
         self._write(f"  {self.elapsed:5.1f}s     {text}")
 
+    def lines(self, rendered: Sequence[str]) -> None:
+        """Emit already-formatted lines, e.g. a rendered interpretation block."""
+        for line in rendered:
+            self._write(line)
+
     def note(self, text: str) -> None:
         self._write(f"    {self.style.dim(text)}")
+
+    def mark(self, outcome: Outcome) -> str:
+        return {
+            Outcome.PASS: self.style.green("PASS"),
+            Outcome.FAIL: self.style.red("FAIL"),
+            Outcome.SKIP: self.style.dim("SKIP"),
+        }[outcome]
+
+    def check(self, check: Check, width: int = 48) -> None:
+        """One line for the result, indented detail only when it needs acting on."""
+        self._write(f"    {self.mark(check.outcome)}  {check.name:<{width}}"
+                    f"{self.style.dim(check.detail)}")
+        if check.outcome is Outcome.PASS:
+            return
+        if check.outcome is Outcome.FAIL and check.explain:
+            self._write(f"          {check.explain}")
+        if check.recommendation:
+            self._write(f"          {self.style.dim('-> ' + check.recommendation)}")
 
     def verdict(self, result: ScenarioResult) -> None:
         self._write()
         self._write(f"  {self.style.dim('Verdict')}")
         for check in result.checks:
-            mark = (
-                self.style.green("PASS") if check.passed else self.style.red("FAIL")
-            )
-            self._write(f"    {mark}  {check.name:<48}{self.style.dim(check.detail)}")
-            if check.explain and not check.passed:
-                self._write(f"          {self.style.dim(check.explain)}")
+            self.check(check)
         self._write()
         if result.passed:
             self._write(f"  {self.style.green('All guarantees held.')}")

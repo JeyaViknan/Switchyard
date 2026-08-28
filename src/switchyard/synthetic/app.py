@@ -198,7 +198,10 @@ def create_app(state: FleetState | None = None) -> FastAPI:
 
     @app.put("/control/profiles/{provider}")
     async def put_profile(provider: str, patch: dict[str, Any]) -> dict[str, Any]:
-        updated = apply_patch(fleet.get(provider), dict(patch))
+        # Create-or-update. Standing in for a configuration's real provider names
+        # means the fleet has to be able to answer to names it did not ship with.
+        base = fleet.profiles.get(provider) or replace(DEFAULT_FLEET["fast"], name=provider)
+        updated = apply_patch(base, dict(patch))
         updated.validate()
         fleet.profiles[provider] = updated
         return profile_json(updated)

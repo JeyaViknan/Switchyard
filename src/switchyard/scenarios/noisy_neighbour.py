@@ -211,23 +211,23 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
     no_leak = final["inflight"] == 0 and final["queue_depth"] == 0
 
     result = ScenarioResult(NAME, [
-        Check(
+        Check.result(
             "quiet tenant kept being served", kept_serving,
             f"{during_rps:.2f} of {quiet_rate:g} req/s offered",
             "its throughput collapsed once the neighbour arrived",
         ),
-        Check(
+        Check.result(
             "quiet tenant was not made to wait", stayed_responsive,
             f"queue wait p95 {during_wait:.0f}ms",
             "it spent a long time queued behind the flood",
         ),
-        Check(
+        Check.result(
             "the flood was charged to the tenant causing it", absorbed_by_noisy,
             f"{sum(noisy_rejected.values())} noisy rejected, "
             f"{sum(quiet_rejected.values())} quiet rejected",
             "rejections landed on the wrong tenant",
         ),
-        Check(
+        Check.result(
             "no capacity leaked", no_leak,
             f"{final['inflight']} in flight, {final['queue_depth']} queued at rest",
             "capacity was still held after everything finished",

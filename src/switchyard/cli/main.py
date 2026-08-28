@@ -64,6 +64,24 @@ def cmd_scenario(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    from switchyard import verify
+    from switchyard.core.config import ConfigError
+    from switchyard.scenarios.base import Reporter
+
+    reporter = Reporter()
+    try:
+        result = asyncio.run(verify.run(
+            reporter, config_path=args.config,
+            contention_s=args.contention, failure_s=args.failure, seed=args.seed,
+        ))
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return 2
+    reporter.verdict(result)
+    return result.exit_code
+
+
 def cmd_keys_mint(args: argparse.Namespace) -> int:
     from switchyard.core.auth import PEPPER_ENV, mint_admin_key, mint_key
 
@@ -90,31 +108,35 @@ def cmd_keys_mint(args: argparse.Namespace) -> int:
 
 
 def cmd_config_check(args: argparse.Namespace) -> int:
+    """Static validation and interpretation. No services, no load."""
+    from switchyard.analysis import interpret, render_interpretation, review
     from switchyard.core.config import ConfigError, load_config
+    from switchyard.scenarios.base import Outcome, Reporter
 
     try:
         config = load_config(args.config)
+        config.validate()
     except ConfigError as exc:
-        print(f"invalid: {exc}", file=sys.stderr)
-        return 1
+        print(f"{args.config} is not valid: {exc}", file=sys.stderr)
+        return 2
 
-    reserved = sum(t.reserved_concurrency for t in config.tenants)
-    print(f"{args.config} is valid.\n")
-    print(f"  capacity          {config.max_concurrency} concurrent requests")
-    print(f"  policy            {config.scheduling_policy}")
-    print(f"  reserved floors   {reserved} ({config.max_concurrency - reserved} shared)")
-    print(f"  tenants           {len(config.tenants)}")
-    for t in config.tenants:
-        budget = f"{t.budget_tokens:,} tokens" if t.budget_tokens else "unlimited"
-        print(f"    {t.id:<12} weight {t.weight:<5g} floor {t.reserved_concurrency:<3} "
-              f"ceiling {t.max_concurrency or '-':<4} budget {budget}")
-    print(f"  providers         {', '.join(config.providers)}")
-    for model, route in config.routes.items():
-        print(f"    {model:<12} -> {' then '.join(route)}")
-    if not config.admin_key_sha256 and config.tenants:
-        print("\n  warning: no gateway.admin_key_sha256 set, so the operational")
-        print("           endpoints are disabled. Mint one with:")
-        print("             switchyard keys mint --admin")
+    reporter = Reporter()
+    reporter.heading("configuration check", args.config)
+    checks = review(config)
+    for check in checks:
+        reporter.check(check, width=44)
+
+    reporter.section("")
+    reporter.section("What this configuration means")
+    reporter.lines(render_interpretation(interpret(config), reporter.style))
+    print()
+
+    failed = [c for c in checks if c.outcome is Outcome.FAIL]
+    if failed:
+        print(f"  {reporter.style.red(f'{len(failed)} problem(s) to fix.')}\n")
+        return 1
+    print(f"  {reporter.style.green('Configuration is valid.')}")
+    print(f"  {reporter.style.dim('Run `switchyard verify` to check it under load.')}\n")
     return 0
 
 
@@ -150,6 +172,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help="scheduling policy to demonstrate")
     scenario.add_argument("--seed", type=int, default=None)
     scenario.set_defaults(func=cmd_scenario)
+
+    verify = sub.add_parser(
+        "verify", help="check whether your configuration's guarantees actually hold"
+    )
+    verify.add_argument("--config", default="switchyard.toml")
+    verify.add_argument("--contention", type=float, default=8.0,
+                        help="seconds of tenant contention")
+    verify.add_argument("--failure", type=float, default=6.0,
+                        help="seconds of provider failure")
+    verify.add_argument("--seed", type=int, default=1)
+    verify.set_defaults(func=cmd_verify)
 
     keys = sub.add_parser("keys", help="mint credentials")
     keys_sub = keys.add_subparsers(dest="keys_command", required=True)
