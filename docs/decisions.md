@@ -286,3 +286,133 @@ which looked like a bug and was not: if every tenant's work eventually drains,
 all of it completes regardless of ordering. Weighting changes who waits, so the
 benchmark has to keep the contended tenants backlogged for the whole measurement
 window.
+
+
+## Week 3 -- reliability
+
+**Four timeouts, not one.**
+A single read deadline cannot distinguish a provider that never answered from
+one that answered and then stalled, and it makes both wait its full duration
+before anything notices. Connect, time-to-first-token, inter-token and total now
+each produce a distinct error class, because what happens next depends on which
+one fired.
+
+The per-chunk deadlines wrap only the await on the next chunk, never the yield
+to the consumer. Otherwise backpressure from a slow client would be measured as
+a stalled provider, and the breaker would open for something the provider did
+correctly. The total deadline is wall-clock and therefore *does* include time
+spent writing to the client, which is why it is excluded from provider health.
+
+**Failover is phased on what has been delivered, not on the kind of error.**
+Before the first token nothing has reached the client, so another provider can
+serve the request and the caller never learns the first one failed. After the
+first token it cannot: switching would splice a second continuation onto a
+partial answer and return corrupted output under a success status. A visible
+error can be retried by the caller; silently corrupt output cannot even be
+detected. So a mid-stream failure terminates with a typed frame carrying how
+many tokens actually arrived.
+
+This is the reason the TTFT deadline is deliberately tight. It is the lever that
+moves failure mass out of the unrecoverable window and into the one where
+recovery is invisible, and `switchyard_terminal_failures_total` is labelled by
+phase so the effect of moving it is measurable rather than assumed.
+
+**Failover reuses one capacity lease and one budget reservation.**
+A retry is still one request competing for capacity, so it holds one slot for
+its whole life however many providers it tries. And because failover only
+happens when zero tokens were produced, there is no output to double-charge.
+Both are asserted under load rather than argued.
+
+**Only failures the provider is responsible for count against it.**
+A malformed request fails identically everywhere, so letting one tenant's bad
+requests open the breaker would take a healthy provider away from every other
+tenant. A total timeout can be caused by a slow consumer. `ErrorClass` carries
+that distinction as `counts_against_provider`, so the policy lives with the
+taxonomy rather than being re-derived at each call site.
+
+**The breaker needs a minimum sample count, jitter, and bounded probes.**
+Without a minimum, the first failure after a quiet period is a 100% failure rate
+and opens the breaker on one unlucky request. Without jitter, everything waiting
+on a provider retries at the same instant it half-opens, so a recovering
+provider is hit by a synchronised stampede. Without a probe limit, the same
+thing happens within the half-open window. The cooldown also doubles on repeated
+trips, so a provider that is still broken is backed off rather than polled.
+
+**An abandoned probe is released.**
+A client disconnecting mid-stream leaves a half-open probe with no verdict. If
+the slot were not returned, the breaker could never gather enough evidence to
+close and the provider would stay shut out permanently -- a liveness bug that
+only appears under exactly the conditions that make it hardest to notice.
+
+**Exhaustion reports every attempt, not just the last error.**
+When several providers are tried and all fail, returning only the final message
+hides that a failover happened at all. "all providers for model X are
+unavailable (a: server_error, b: connect)" is the difference between diagnosing
+one bad provider and diagnosing an outage. This was found by a test that
+expected the aggregate and got the raw last error.
+
+**Drain treats queued and running work differently.**
+A queued request has not started, so refusing it costs nothing and the client
+can go elsewhere immediately. A running one has already consumed provider
+capacity and may have delivered tokens, so killing it wastes what was paid for
+and hands back a truncated answer. Queued work is therefore rejected at once and
+running work is waited for.
+
+The wait is bounded. A provider that never finishes would otherwise hold
+shutdown open indefinitely, so past the timeout the remainder is abandoned and
+*reported* rather than silently waited on. `/health` returns 503 while draining
+-- readiness, not liveness: the process still works, it just should not be given
+anything more.
+
+**The router takes a per-request observer.**
+Which provider served a request, and how many attempts it took, are facts about
+that request rather than about the router. Passing the observer per call is also
+what lets the pump label metrics with the provider that actually answered, which
+is not known until one does and may not be the first one tried.
+
+
+## Week 3 -- what the outage benchmark showed
+
+Run `make bench-faults`. Steady load, one provider returning 5xx from 12s to 30s,
+same workload and seed in both arms; the only difference is whether a fallback
+exists.
+
+Client-visible success during the outage went from 16/120 (13%) without failover
+to 48/48 (100%) with it. The breaker opened at 16.3s in the single-provider arm
+and 21.4s with failover, and 26 requests were served by the fallback.
+
+Two things worth noting because they are easy to get wrong.
+
+*Surviving an outage is not free.* With failover, p99 rose from about 3s to
+10-20s: requests moved to a slower provider and capacity saturated. Reporting
+only the error rate would make the reliability layer look costless.
+
+*The breaker helps even with nowhere to fail over to.* In the single-provider arm
+p99 **dropped** to about 10ms during the outage, because once the breaker opened
+the gateway stopped paying to rediscover the outage on every request. Fast
+failure is a genuine improvement over slow failure even when the answer is still
+an error, and it is a separate benefit from failover.
+
+**The benchmark found a bug in the instrument, not the product.** The first run
+reported 370/370 requests completing during a total outage with no fallback. The
+load generator judged success by stream *shape*: any well-formed SSE stream
+ending in `[DONE]` counted as complete. But a typed error frame ends exactly that
+way -- carrying the failure in the terminal frame is the whole design -- so every
+provider outage scored as a success. The generator now reads `finish_reason`, and
+a regression test asserts that a stream can be well-formed and still be a failed
+request.
+
+That also surfaced a product wart. A non-streaming request where every provider
+failed returned 200 with an error body, making the client inspect the body to
+discover the failure. It now returns 502 when nothing was delivered. Partial
+content still returns 200: the client has real tokens, and the error frame
+explains why there are not more -- the same contract the streaming path offers.
+
+**Not every number here reproduces, and the difference matters.** The
+during-outage figures, the failover count and the moment the breaker first opens
+are stable across runs. Whole-run completion for the single-provider arm is not:
+two runs of the identical scenario gave 58% and 24%. Whether a half-open probe
+lands while the provider is still broken decides how long the breaker stays shut
+afterwards, and the jittered doubling cooldown moves recovery by tens of seconds.
+That is the backoff working as designed rather than measurement noise, so the
+documented result is the stable one.

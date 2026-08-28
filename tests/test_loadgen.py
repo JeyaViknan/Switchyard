@@ -319,3 +319,42 @@ async def test_different_seed_produces_a_different_workload(fleet_server):
     a = await run_load(LoadSpec(seed=1, **base))
     b = await run_load(LoadSpec(seed=2, **base))
     assert [r.output_tokens for r in a] != [r.output_tokens for r in b]
+
+
+# -- failures the gateway signals inside a well-formed stream ---------------
+
+
+async def test_a_gateway_error_frame_is_counted_as_a_failure(fleet_server):
+    """A provider failure arrives as a normal-looking stream ending in [DONE].
+
+    The terminal frame carries the error. Judging success by stream shape alone
+    counted every provider outage as a completed request, which made an outage
+    benchmark report 100% success while the provider was returning 5xx.
+    """
+    from tests.conftest import serve_gateway
+
+    from switchyard.core.auth import mint_key
+    from switchyard.core.config import BreakerConfig, GatewayConfig, Tenant
+
+    raw, digest = mint_key("t1")
+    config = GatewayConfig(
+        max_concurrency=4, providers=("quick", "held"),
+        routes={"quick": ("quick",)},
+        breaker=BreakerConfig(min_samples=1000, window=1000),   # never trips here
+        tenants=(Tenant(id="t1", key_sha256=digest),),
+    )
+    config.validate()
+
+    fleet_server.state.profiles["quick"] = fleet_server.state.profiles["quick"].with_faults(
+        FaultSpec(error_rate=1.0)
+    )
+    async with serve_gateway(config, fleet_server, {"t1": raw}) as gw:
+        records = await run_load(LoadSpec(
+            url=f"{gw.base_url}/v1/chat/completions", rate=8.0, duration_s=0.6,
+            model="quick", tenants=("t1",), seed=5, api_key=raw,
+        ))
+
+    assert records
+    assert all(r.status == 200 for r in records), "the SSE response itself is well-formed"
+    assert all(not r.ok for r in records), "but every request failed and must count as one"
+    assert all(r.finish_reason == "provider_error" for r in records)

@@ -25,7 +25,7 @@ deliverable.
 
 ## Status
 
-Weeks 1-2 of 4 complete: the measurement rig, and the scheduler.
+Weeks 1-3 of 4 complete: the measurement rig, the scheduler, and reliability.
 
 The rig was built before any gateway feature, deliberately. A benchmark harness
 written after the system it measures tends to be shaped by the results it finds;
@@ -39,7 +39,9 @@ one written first is shaped by the question being asked.
 | Admission control and queueing | Done — bounded queues, deadlines, leak-proof leases |
 | Weighted fair scheduling | Done — measured against a FIFO baseline |
 | Token budgets | Done — reserve, settle, clamp, hard spending bound |
-| Reliability: failover, breakers, timeouts | Week 3 |
+| Timeout decomposition | Done — four deadlines, four error classes |
+| Failover and circuit breaking | Done — measured against a single-provider baseline |
+| Graceful drain | Done — refuses queued work, finishes running work |
 | Semantic-cache experiment, report | Week 4 |
 
 ## Why the load generator is open-loop
@@ -243,12 +245,112 @@ the remaining headroom and tells the client via
 never overspends. Below a useful floor the request is refused with **402** —
 not 429, because retrying will never help.
 
+## Reliability
+
+### Four timeouts, not one
+
+A single read deadline cannot tell a provider that never answered from one that
+answered and then stalled, and makes both wait its full duration before anything
+notices. Each deadline produces a distinct error class, because what happens
+next depends on which fired:
+
+| Deadline | Meaning | Default |
+|---|---|---|
+| `connect_s` | could not reach the provider | 2 s |
+| `ttft_s` | connected, no first token | 8 s |
+| `inter_token_s` | was streaming, then stalled | 10 s |
+| `total_s` | whole response took too long | 300 s |
+
+The per-chunk deadlines wrap only the await on the provider, never the yield to
+the client, so backpressure from a slow consumer is not mistaken for a stalled
+provider.
+
+### Failover is phased on what has been delivered
+
+Not on the kind of error — on whether anything already reached the client.
+
+**Before the first token**, nothing has been delivered, so another provider can
+serve the request and the caller never learns the first one failed.
+
+**After the first token**, it cannot. Switching mid-response would splice a
+second continuation onto a partial answer and return corrupted output under a
+success status. A visible error can be retried by the caller; silent corruption
+cannot even be detected. So a mid-stream failure terminates with a typed frame
+carrying `tokens_emitted` — exactly what the client received.
+
+This is why `ttft_s` is deliberately tight: it is the lever that moves failure
+mass out of the unrecoverable window into the one where recovery is invisible.
+`switchyard_terminal_failures_total` is labelled by phase so moving it is
+measurable rather than assumed.
+
+Failover reuses **one** capacity lease and **one** budget reservation. A retry is
+still one request competing for capacity, and since failover only happens at zero
+tokens, there is no output to double-charge.
+
+### Circuit breaking
+
+Rolling-window breaker per provider, with a minimum sample count so one unlucky
+request after a quiet period cannot open it. Cooldown is jittered and doubles on
+repeated trips, so a recovering provider is not hit by a synchronised retry;
+half-open admits a bounded number of probes. Only failures the provider is
+responsible for count — a caller's malformed request fails identically
+everywhere, and a total timeout includes time spent writing to a slow client.
+
+`GET /v1/providers` shows breaker state, error breakdown and observed latency per
+provider.
+
+### Under a real outage
+
+Steady load, one provider returning 5xx from 12 s to 30 s. Same workload and seed
+in both arms; the only difference is whether a fallback exists.
+
+```
+                    during the outage    breaker opened    failovers
+single provider       16/120  (13%)          16.3s             0
+with failover         48/48  (100%)          21.4s            26
+```
+
+Client-visible success during a total provider outage goes from **13% to 100%**.
+
+The latency panel shows the part that is easy to miss. With failover, p99 rises
+from ~3 s to ~10-20 s: requests move to a slower fallback and capacity saturates,
+so surviving the outage is not free. Without failover, p99 *drops* to ~10 ms once
+the breaker opens — the gateway stops paying to rediscover the outage on every
+request, and fast failure is a real improvement over slow failure even when the
+answer is still an error.
+
+Reproduce with `make bench-faults`.
+
+**What is and is not reproducible here.** The during-outage figures above are
+stable across seeds and runs, as are the failover count and the moment the
+breaker first opens. Whole-run completion rate for the single-provider arm is
+*not*: across two runs of the identical scenario it came out 58% and 24%. That
+is the jittered exponential backoff working as designed — whether a half-open
+probe happens to land while the provider is still broken decides how long the
+breaker stays shut afterwards, and that shifts recovery by tens of seconds. It
+is a real property of the system rather than measurement noise, so the headline
+number here is the one that holds.
+
+### Graceful drain
+
+Queued and running work are treated differently. A queued request has not
+started, so refusing it costs nothing and the client can go elsewhere at once. A
+running one has consumed capacity and may have delivered tokens, so killing it
+wastes what was paid for. Queued work is rejected immediately, running work is
+waited for, and the wait is bounded so a provider that never finishes cannot hold
+shutdown open.
+
+`/health` returns 503 while draining — readiness, not liveness: the process still
+works, it just should not be given anything more. `POST /v1/admin/drain` triggers
+it without stopping the process.
+
 ## Running it
 
 ```bash
 make install
 make check           # lint, types, tests
 make bench-fairness  # the fairness comparison above
+make bench-faults    # the provider-outage recovery timeline
 make bench           # regenerates every figure in plots/
 ```
 
@@ -263,7 +365,8 @@ curl -sN localhost:8000/v1/chat/completions -H "Authorization: Bearer sk_sy_acme
 ```
 
 `GET /v1/scheduler/stats` shows live capacity, per-tenant queue depth, budget
-position, and current output-length predictions. Mint keys with
+position, and current output-length predictions. `GET /v1/providers` shows
+breaker state and error breakdown. Mint keys with
 `python -m switchyard.core.auth <tenant-id>`.
 
 Or the full stack with dashboards:

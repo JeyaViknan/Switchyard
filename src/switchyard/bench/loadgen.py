@@ -202,6 +202,12 @@ async def _run_one(
                     record.output_tokens += 1
                 if choice.get("finish_reason"):
                     record.finish_reason = choice["finish_reason"]
+                # A gateway error arrives as a well-formed stream that ends in
+                # [DONE] like any other -- the terminal frame carries the
+                # failure. Judging success by stream shape alone would count
+                # every provider outage as a completed request.
+                if frame.get("error") or choice.get("finish_reason") == "provider_error":
+                    record.error = frame.get("error", {}).get("type", "provider_error")
                 if usage := frame.get("usage"):
                     record.prompt_tokens = usage.get("prompt_tokens", 0)
                     # Provider-reported usage is authoritative over our count.

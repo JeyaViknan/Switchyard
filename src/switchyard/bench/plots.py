@@ -143,3 +143,54 @@ def fairness_comparison(results: dict, tenants, path: str) -> str:
 
     fig.suptitle("Multi-tenant fairness under sustained backlog")
     return _save(fig, path)
+
+
+def outage_timeline(results: dict, outage: tuple[float, float], path: str) -> str:
+    """Client-visible error rate and latency through an injected provider outage.
+
+    Two panels because surviving an outage and surviving it cheaply are separate
+    questions. The error-rate panel shows whether clients got answers; the
+    latency panel shows what those answers cost, and makes visible that a
+    breaker helps both configurations -- with failover it stops paying to
+    rediscover the outage on every request, and without it, failures at least
+    become fast instead of slow.
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6.4), sharex=True)
+    colours = {"single": "#b0b0b0", "failover": "#3572b0"}
+
+    for ax in (ax1, ax2):
+        ax.axvspan(outage[0], outage[1], color="#f2c9c9", alpha=0.5,
+                   label="provider returning 5xx")
+        ax.grid(alpha=0.3)
+
+    for key, result in results.items():
+        series = result["series"]
+        ax1.plot(series["t"], [e * 100 for e in series["error_rate"]],
+                 "-", color=colours[key], label=result["arm"], lw=1.8)
+        ax2.plot(series["t"], series["p99_ms"], "-", color=colours[key],
+                 label=result["arm"], lw=1.8)
+
+    # Mark, per arm, when the gateway stopped sending traffic to the dead
+    # provider. The two arms trip at different times, so marking only one would
+    # attribute the wrong moment to the other.
+    for key, result in results.items():
+        opened = next((t for t, state in result["breaker"] if state == "open"), None)
+        if opened is None:
+            continue
+        for ax in (ax1, ax2):
+            ax.axvline(opened, color=colours[key], ls="--", lw=1.2, alpha=0.9)
+        ax1.annotate(f"breaker open ({result['arm']})", (opened, 52), fontsize=7,
+                     color=colours[key], rotation=90, va="center",
+                     xytext=(3, 0), textcoords="offset points")
+
+    ax1.set_ylabel("client-visible errors (%)")
+    ax1.set_ylim(-5, 105)
+    ax1.set_title("Provider outage: what the client experienced")
+    ax1.legend(fontsize=8, loc="center left")
+
+    ax2.set_ylabel("p99 latency (ms)")
+    ax2.set_xlabel("time (s)")
+    ax2.set_yscale("log")
+    ax2.legend(fontsize=8, loc="upper left")
+
+    return _save(fig, path)

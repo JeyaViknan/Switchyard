@@ -396,7 +396,17 @@ def create_app(
             async with stack:
                 payload = await collect(router.stream(parsed, observer), parsed, timeline)
                 finish(int(payload["usage"]["completion_tokens"]))
-            return JSONResponse(payload, headers=headers | _routing_headers(observer))
+            # Nothing was delivered and the providers failed: that is a gateway
+            # failure, and saying so in the status line is clearer than a 200
+            # whose body has to be inspected to discover it. A partial response
+            # still returns 200 -- the client does have real content, and the
+            # error frame explains why there is not more of it, which is the
+            # same contract the streaming path offers.
+            error = payload.get("error")
+            status = 502 if error and not payload["usage"]["completion_tokens"] else 200
+            return JSONResponse(
+                payload, status_code=status, headers=headers | _routing_headers(observer)
+            )
 
         async def body_iter():
             # The stack owns both the capacity lease and the budget reservation.

@@ -98,6 +98,9 @@ async def test_when_every_provider_fails_the_client_gets_a_typed_terminal_error(
         after = await scheduler_stats(gw)
 
     payload = r.json()
+    # Nothing was delivered, so the status line says so rather than making the
+    # client inspect a 200 body to discover the request failed.
+    assert r.status_code == 502
     assert payload["choices"][0]["finish_reason"] == "provider_error"
     assert "all providers" in payload["error"]["message"]
     assert after["inflight"] == 0, "capacity must be released even when everything failed"
@@ -112,6 +115,10 @@ async def test_a_mid_stream_failure_is_not_failed_over(fleet_server):
         r = await post(gw, "alpha")
 
     payload = r.json()
+    # Partial content still returns 200: the client has real tokens, and the
+    # error frame explains why there are not more -- the same contract the
+    # streaming path offers.
+    assert r.status_code == 200
     assert payload["choices"][0]["finish_reason"] == "provider_error"
     assert payload["error"]["tokens_emitted"] == 3
     assert r.headers.get("x-switchyard-failed-over") is None
