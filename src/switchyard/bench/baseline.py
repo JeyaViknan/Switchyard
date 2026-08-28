@@ -26,70 +26,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
-import socket
-import subprocess
-import sys
-import time
 from collections.abc import Sequence
 
 import httpx
 
+from switchyard.bench.harness import Service
 from switchyard.bench.loadgen import LoadSpec, run_load_detailed
 from switchyard.bench.plots import distribution, latency_vs_offered_load
 from switchyard.bench.stats import summarize, write_parquet
-
-
-def free_port() -> int:
-    """Reserve a port by binding and releasing it.
-
-    Racy in principle; in practice the window is microseconds and the
-    alternative -- parsing a port out of a subprocess's log output -- is worse.
-    """
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-class Service:
-    """A uvicorn subprocess."""
-
-    def __init__(self, app: str, port: int, env: dict[str, str] | None = None) -> None:
-        self.port = port
-        self.base_url = f"http://127.0.0.1:{port}"
-        self._proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "uvicorn", app,
-                "--host", "127.0.0.1", "--port", str(port),
-                "--log-level", "error", "--no-access-log",
-            ],
-            env={**os.environ, **(env or {})},
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-
-    async def wait_healthy(self, timeout_s: float = 30.0) -> None:
-        deadline = time.perf_counter() + timeout_s
-        async with httpx.AsyncClient(timeout=1.0) as c:
-            while time.perf_counter() < deadline:
-                if self._proc.poll() is not None:
-                    err = (self._proc.stderr.read().decode() if self._proc.stderr else "")
-                    raise RuntimeError(f"{self.base_url} exited during startup:\n{err}")
-                try:
-                    if (await c.get(f"{self.base_url}/health")).status_code == 200:
-                        return
-                except httpx.HTTPError:
-                    pass
-                await asyncio.sleep(0.05)
-        raise RuntimeError(f"{self.base_url} did not become healthy in {timeout_s}s")
-
-    def stop(self) -> None:
-        self._proc.terminate()
-        try:
-            self._proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self._proc.kill()
-            self._proc.wait(timeout=5)
 
 
 def histogram_quantile(buckets: list[tuple[float, float]], q: float) -> float:
@@ -174,9 +118,9 @@ async def run(
     rates: Sequence[float], duration_s: float, warmup_s: float, model: str, seed: int,
     max_tokens: int, max_connections: int, out_dir: str, plot_dir: str,
 ) -> list[dict]:
-    fleet = Service("switchyard.synthetic.app:app", free_port())
+    fleet = Service("switchyard.synthetic.app:app")
     gateway = Service(
-        "switchyard.gateway.app:app", free_port(),
+        "switchyard.gateway.app:app",
         env={"SWITCHYARD_FLEET_URL": fleet.base_url},
     )
 

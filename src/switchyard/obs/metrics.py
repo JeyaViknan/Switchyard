@@ -91,10 +91,79 @@ TTFT = Histogram(
 
 QUEUE_WAIT = Histogram(
     "switchyard_queue_wait_seconds",
-    "Time blocked in admission control. Structurally zero until the admission "
-    "controller exists; wired now so queue wait cannot become invisible when it "
-    "does.",
-    ["model"], buckets=LATENCY_BUCKETS, registry=REGISTRY,
+    "Time blocked in admission control before capacity was granted.",
+    ["tenant"], buckets=LATENCY_BUCKETS, registry=REGISTRY,
+)
+
+QUEUE_DEPTH = Gauge(
+    "switchyard_queue_depth", "Requests waiting for capacity.",
+    ["tenant"], registry=REGISTRY,
+)
+
+TENANT_INFLIGHT = Gauge(
+    "switchyard_tenant_inflight", "Requests holding a capacity slot.",
+    ["tenant"], registry=REGISTRY,
+)
+
+CAPACITY_UTILISATION = Gauge(
+    "switchyard_capacity_utilisation",
+    "In-flight requests as a fraction of gateway max_concurrency.",
+    registry=REGISTRY,
+)
+
+ADMISSION_REJECTED = Counter(
+    "switchyard_admission_rejected_total",
+    "Requests refused before consuming provider capacity, by reason. Which "
+    "limit is binding is the first question under overload.",
+    ["tenant", "reason"], registry=REGISTRY,
+)
+
+DISPATCHED = Counter(
+    "switchyard_dispatched_total", "Requests granted capacity.",
+    ["tenant"], registry=REGISTRY,
+)
+
+TENANT_TOKENS = Counter(
+    "switchyard_tenant_tokens_total",
+    "Output tokens consumed per tenant. The unit fairness is measured in, so "
+    "this is what a fairness panel should divide.",
+    ["tenant"], registry=REGISTRY,
+)
+
+BUDGET_REMAINING = Gauge(
+    "switchyard_budget_tokens_remaining",
+    "Tokens a tenant may still spend: limit minus settled spend minus what is "
+    "currently reserved for in-flight requests.",
+    ["tenant"], registry=REGISTRY,
+)
+
+BUDGET_RESERVED = Gauge(
+    "switchyard_budget_tokens_reserved",
+    "Tokens held for in-flight requests. Held at each request's ceiling, not at "
+    "its predicted length, so the spending bound holds by construction.",
+    ["tenant"], registry=REGISTRY,
+)
+
+BUDGET_SPENT = Counter(
+    "switchyard_budget_tokens_spent_total",
+    "Tokens actually consumed and charged.",
+    ["tenant"], registry=REGISTRY,
+)
+
+MAX_TOKENS_CLAMPED = Counter(
+    "switchyard_max_tokens_clamped_total",
+    "Requests whose max_tokens was reduced to fit remaining budget. A rising "
+    "count means a tenant is running out, not that anything is broken.",
+    ["tenant"], registry=REGISTRY,
+)
+
+PREDICTION_ERROR = Histogram(
+    "switchyard_output_prediction_ratio",
+    "Actual output tokens divided by the scheduler's estimate. Centred on 1.0 "
+    "means the predictor is unbiased; drift shows scheduling decisions are "
+    "being made on the wrong cost.",
+    buckets=(0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.5, 2.0, 4.0, 10.0, float("inf")),
+    registry=REGISTRY,
 )
 
 PROVIDER_TIME = Histogram(
@@ -154,10 +223,11 @@ class RequestTimeline:
 
     __slots__ = (
         "arrived_at", "queue_wait_s", "dispatched_at", "first_token_at",
-        "last_token_at", "provider_done_at", "tokens",
+        "last_token_at", "provider_done_at", "tokens", "tenant_id",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, tenant_id: str = "-") -> None:
+        self.tenant_id = tenant_id
         self.arrived_at = time.perf_counter()
         self.queue_wait_s = 0.0
         self.dispatched_at: float | None = None
@@ -198,7 +268,7 @@ class RequestTimeline:
 
         REQUESTS.labels(model=model, provider=provider, outcome=outcome).inc()
         REQUEST_DURATION.labels(model=model, provider=provider).observe(total)
-        QUEUE_WAIT.labels(model=model).observe(self.queue_wait_s)
+        QUEUE_WAIT.labels(tenant=self.tenant_id).observe(self.queue_wait_s)
         PROVIDER_TIME.labels(model=model, provider=provider).observe(provider_time)
         if self.first_token_at is not None:
             TTFT.labels(model=model, provider=provider).observe(

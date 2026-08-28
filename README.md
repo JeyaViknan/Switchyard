@@ -25,7 +25,7 @@ deliverable.
 
 ## Status
 
-Week 1 of 4 complete: the measurement rig.
+Weeks 1-2 of 4 complete: the measurement rig, and the scheduler.
 
 The rig was built before any gateway feature, deliberately. A benchmark harness
 written after the system it measures tends to be shaped by the results it finds;
@@ -35,10 +35,11 @@ one written first is shaped by the question being asked.
 |---|---|
 | Synthetic provider fleet | Done — deterministic, runtime fault injection |
 | Open-loop load generator | Done — Poisson arrivals, SSE-aware, per-token timing persisted |
-| Gateway | Passthrough only — no auth, limits, cache, or scheduler yet |
-| Baseline measurement | Done — latency floor only, no saturation knee |
-| Admission control + DRR scheduler | Week 2 |
-| Capacity accounting, reliability | Week 3 |
+| Multi-tenant auth and config | Done — API keys, per-tenant weights, floors, ceilings |
+| Admission control and queueing | Done — bounded queues, deadlines, leak-proof leases |
+| Weighted fair scheduling | Done — measured against a FIFO baseline |
+| Token budgets | Done — reserve, settle, clamp, hard spending bound |
+| Reliability: failover, breakers, timeouts | Week 3 |
 | Semantic-cache experiment, report | Week 4 |
 
 ## Why the load generator is open-loop
@@ -148,13 +149,122 @@ measurement.
 The overload experiment will need much higher offered load, repeats, and a knee.
 None of that is claimed here.
 
+## How scheduling works
+
+The scarce resource is concurrent in-flight requests to providers. A request
+holds a slot from dispatch until its stream ends, and how long that takes is not
+knowable in advance.
+
+Capacity splits into a reserved pool and a shared pool:
+
+```
+shared_capacity = max_concurrency - sum(tenant.reserved_concurrency)
+```
+
+A tenant below its own `reserved_concurrency` always has a slot — that floor is
+why a noisy neighbour cannot starve it. Above the floor it competes for the
+shared pool, ordered by weighted fair queueing and capped by its own
+`max_concurrency`. Configuration refuses reserved totals above capacity, because
+guarantees that cannot all be honoured at once are an overdraft, not a floor.
+
+Ordering uses per-tenant virtual clocks: each advances by `cost / weight` on
+dispatch, and the scheduler serves whichever backlogged tenant's clock is
+furthest behind. **Cost is measured in tokens, not requests.** A tenant sending
+4000-token completions consumes roughly ten times the capacity of one sending
+400-token completions at the same request rate; request-count fairness would
+call that fair.
+
+Scheduling has to commit before the real cost is known, so the clock advances on
+a predicted length and is **corrected against the actual** when the lease
+releases. Without that, a tenant whose requests systematically run longer than
+predicted would be under-charged on every one and drift into a permanently
+larger share.
+
+## Fairness under sustained backlog
+
+Three tenants, gateway capacity well below offered load. `interactive` asks for
+less than its share; `noisy` and `premium` are both permanently backlogged, with
+`premium` weighted 3×. The same workload and seed run under both policies, so
+arrivals and provider responses are identical between arms — only the scheduling
+decision differs.
+
+```
+--- FIFO (baseline) ---
+tenant         done    tok/s   share  qwait p50  qwait p95  rejected
+interactive      18    107.7    9.2%     19541m     19980m        10
+noisy           107    552.0   46.9%     19514m     19992m       928
+premium          98    516.7   43.9%     19475m     19997m       937
+                        weighted fairness (Jain index): 0.784
+
+--- weighted fair ---
+tenant         done    tok/s   share  qwait p50  qwait p95  rejected
+interactive      28    170.3   13.5%        82m       273m         0
+noisy            50    250.9   19.8%     18268m     19984m       985
+premium         144    843.0   66.7%     19433m     19990m       891
+                        weighted fairness (Jain index): 0.997
+```
+
+Two separate results. **Isolation:** the light tenant's median queue wait falls
+from 19.5 s to 82 ms — 238× — and its rejections go from 10 to zero. Under FIFO
+it was stuck behind a flood it had nothing to do with. **Proportionality:** with
+`interactive` taking 13.5%, the 86.5% actually contended should split 21.6% /
+64.9% by weight; measured 19.8% / 66.7%.
+
+The backlogged tenants still wait ~20 s and shed load — correctly. They are
+offering roughly 7× what the gateway can serve, so the bounded queue and
+deadline reject the excess instead of accumulating work nobody is waiting for.
+Fair scheduling decides *who* waits; it does not create capacity.
+
+Reproduce with `make bench-fairness`. A 65 s run at a different seed gives Jain
+0.999 and 95 ms, with the proportionality gap narrowing from ±1.8pp to ±1.1pp —
+consistent with convergence rather than a systematic bias.
+
+## Token budgets
+
+Three quantities the accounting deliberately keeps apart:
+
+| | Source | Used for | Cost of being wrong |
+|---|---|---|---|
+| Estimated work | predicted p50 | ordering the queue | self-corrects on settlement |
+| Reserved budget | the request's `max_tokens` ceiling | held while in flight | none — it is the worst case |
+| Actual consumption | what the provider emitted | charged on completion | — |
+
+The reservation is the **ceiling, not the estimate**. Reserving a predicted
+length would be right most of the time, and "most of the time" is a different
+guarantee for money than for scheduling: a scheduling mis-estimate self-corrects,
+while a budget mis-estimate is tokens already generated and billed. Because a
+request can never emit more than its `max_tokens`, reserving exactly that makes
+`spent + reserved <= limit` hold by construction.
+
+The cost is that a tenant with 500 tokens left cannot start a request declaring
+`max_tokens=4096`. Rather than refuse it, Switchyard **clamps** `max_tokens` to
+the remaining headroom and tells the client via
+`x-switchyard-max-tokens-clamped`. The response may be cut short; the tenant
+never overspends. Below a useful floor the request is refused with **402** —
+not 429, because retrying will never help.
+
 ## Running it
 
 ```bash
 make install
-make check          # lint, types, tests
-make bench-baseline # regenerates every figure in plots/
+make check           # lint, types, tests
+make bench-fairness  # the fairness comparison above
+make bench           # regenerates every figure in plots/
 ```
+
+Serve it locally against the committed `switchyard.toml`:
+
+```bash
+make dev
+```
+
+```bash
+curl -sN localhost:8000/v1/chat/completions -H "Authorization: Bearer sk_sy_acme_b6525e6c60405226fc726bdda422dd2f" -H 'Content-Type: application/json' -d '{"model":"fast","messages":[{"role":"user","content":"hello"}],"stream":true}'
+```
+
+`GET /v1/scheduler/stats` shows live capacity, per-tenant queue depth, budget
+position, and current output-length predictions. Mint keys with
+`python -m switchyard.core.auth <tenant-id>`.
 
 Or the full stack with dashboards:
 
@@ -167,9 +277,16 @@ make up             # gateway :8000, fleet :8100, prometheus :9090, grafana :300
 ```
 src/switchyard/
   types.py        normalized request and stream-event types; the adapter contract
+  core/           config, auth, scheduler, queue policies, prediction, budgets
   adapters/       provider implementations
   gateway/        HTTP surface and the SSE pump
   obs/            metrics
   synthetic/      the provider fleet (an instrument, not part of the gateway)
   bench/          load generator, statistics, figures, experiments
 ```
+
+The scheduler is in-process and single-replica. Everything it needs — slot
+counts, queues, virtual clocks, budgets — is correct in memory, and distributing
+it would mean atomic counters, lease expiry, and a reaper for slots held by a
+replica that died: real work to solve a problem that does not exist until there
+is a second replica.

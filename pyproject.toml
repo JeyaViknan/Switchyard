@@ -47,6 +47,6 @@ warn_unused_configs = true
 # accounting code get full strictness; benchmark tooling and the synthetic
 # provider do not, because they are instruments rather than the system.
 [[tool.mypy.overrides]]
-module = ["switchyard.adapters.*"]
+module = ["switchyard.core.*", "switchyard.adapters.*"]
 disallow_untyped_defs = true
 strict_equality = true

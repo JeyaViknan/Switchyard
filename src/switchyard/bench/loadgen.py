@@ -85,6 +85,9 @@ class RequestRecord:
     prompt_tokens: int = 0
     finish_reason: str | None = None
     error: str | None = None
+    # Reported by the gateway, so queue wait can be attributed without having to
+    # infer it by subtracting an assumed service time from end-to-end latency.
+    queue_wait_s: float | None = None
     in_window: bool = True
     inter_token_s: list[float] = field(default_factory=list)
 
@@ -145,6 +148,7 @@ class LoadSpec:
     request_timeout_s: float = 120.0
     warmup_s: float = 0.0
     max_connections: int = DEFAULT_MAX_CONNECTIONS
+    api_key: str | None = None
 
 
 async def _run_one(
@@ -161,12 +165,16 @@ async def _run_one(
         "x-switchyard-request-id": record.request_id,
         "x-switchyard-tenant": record.tenant,
     }
+    if spec.api_key:
+        headers["authorization"] = f"Bearer {spec.api_key}"
     last_token_at: float | None = None
     try:
         async with client.stream(
             "POST", spec.url, json=body, headers=headers, timeout=spec.request_timeout_s
         ) as response:
             record.status = response.status_code
+            if (queued := response.headers.get("x-switchyard-queue-wait-ms")) is not None:
+                record.queue_wait_s = float(queued) / 1000.0
             if response.status_code != 200:
                 await response.aread()
                 record.error = f"http_{response.status_code}"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest_asyncio
 import uvicorn
@@ -71,14 +72,91 @@ class RunningGateway:
 
 @pytest_asyncio.fixture
 async def gateway_server(fleet_server: RunningServer) -> AsyncIterator[RunningGateway]:
-    """Gateway wired to the fleet fixture, both over real sockets."""
+    """Gateway with no tenants configured, i.e. open mode.
+
+    Used by tests about the request path itself -- validation, streaming,
+    failure semantics -- where authentication and fairness are not the subject.
+    Capacity is set high so the scheduler never queues and cannot confound them.
+    """
+    from switchyard.core.config import GatewayConfig
     from switchyard.gateway.app import create_app as create_gateway
 
+    config = GatewayConfig(max_concurrency=64, tenants=())
     server, task, port = await _serve(
-        create_gateway(fleet_url=fleet_server.base_url, providers=("quick", "held"))
+        create_gateway(config=config, fleet_url=fleet_server.base_url,
+                       providers=("quick", "held"))
     )
     try:
         yield RunningGateway(f"http://127.0.0.1:{port}", fleet_server)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=5)
+
+
+class TenantGateway(RunningGateway):
+    """A gateway with real tenants, plus the raw keys needed to call it."""
+
+    def __init__(self, base_url: str, fleet: RunningServer, keys: dict[str, str],
+                 config) -> None:
+        super().__init__(base_url, fleet)
+        self.keys = keys
+        self.config = config
+
+    def auth(self, tenant_id: str) -> dict[str, str]:
+        return {"authorization": f"Bearer {self.keys[tenant_id]}"}
+
+
+def build_tenant_config(max_concurrency: int = 4, policy: str = "drr", **tenant_over):
+    """Config with two tenants, returning it alongside their raw keys."""
+    from switchyard.core.auth import mint_key
+    from switchyard.core.config import GatewayConfig, Tenant
+
+    keys: dict[str, str] = {}
+    tenants = []
+    for tid, over in (("alpha", {}), ("beta", {})):
+        raw, digest = mint_key(tid)
+        keys[tid] = raw
+        tenants.append(Tenant(id=tid, key_sha256=digest, **(over | tenant_over)))
+
+    config = GatewayConfig(
+        max_concurrency=max_concurrency, scheduling_policy=policy, tenants=tuple(tenants)
+    )
+    config.validate()
+    return config, keys
+
+
+@asynccontextmanager
+async def serve_gateway(config, fleet: RunningServer, keys: dict[str, str] | None = None):
+    """Run a gateway from an explicit config, over a real socket.
+
+    Used by tests that need capacity or queue limits the shared fixture does not
+    provide. Goes through uvicorn rather than ASGITransport because the app's
+    lifespan builds the provider adapters and the scheduler.
+    """
+    from switchyard.gateway.app import create_app as create_gateway
+
+    server, task, port = await _serve(
+        create_gateway(config=config, fleet_url=fleet.base_url, providers=("quick", "held"))
+    )
+    try:
+        yield TenantGateway(f"http://127.0.0.1:{port}", fleet, keys or {}, config)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=5)
+
+
+@pytest_asyncio.fixture
+async def tenant_gateway(fleet_server: RunningServer) -> AsyncIterator[TenantGateway]:
+    """Gateway with two authenticated tenants and tight capacity, so queueing happens."""
+    from switchyard.gateway.app import create_app as create_gateway
+
+    config, keys = build_tenant_config(max_concurrency=2, policy="drr", deadline_s=10.0)
+    server, task, port = await _serve(
+        create_gateway(config=config, fleet_url=fleet_server.base_url,
+                       providers=("quick", "held"))
+    )
+    try:
+        yield TenantGateway(f"http://127.0.0.1:{port}", fleet_server, keys, config)
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, timeout=5)

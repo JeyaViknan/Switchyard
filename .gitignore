@@ -13,8 +13,7 @@ venv/
 
 # Benchmark artifacts: raw runs are reproducible via `make bench`, so they are
 # not tracked. Committed figures live in plots/ and are added explicitly.
-results/*.parquet
-results/*.json
+results/
 
 # OS
 .DS_Store

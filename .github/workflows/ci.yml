@@ -16,7 +16,7 @@ jobs:
           python-version: "3.14"
       - run: pip install -e ".[dev,bench]"
       - run: ruff check src tests
-      - run: mypy src/switchyard/adapters src/switchyard/types.py
+      - run: mypy src/switchyard/core src/switchyard/adapters src/switchyard/types.py
       - run: pytest -q
 
   # The benchmark suite is not run on every push: it needs a quiet machine to

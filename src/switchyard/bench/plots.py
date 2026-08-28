@@ -79,3 +79,67 @@ def distribution(
     ax.legend()
     ax.grid(alpha=0.3)
     return _save(fig, path)
+
+
+def fairness_comparison(results: dict, tenants, path: str) -> str:
+    """Token share and queue wait per tenant, FIFO against weighted.
+
+    Two panels because the benchmark asks two different questions. Share answers
+    proportionality -- how contended capacity was divided. Queue wait answers
+    isolation -- whether a tenant asking for little still gets served promptly
+    while someone else floods the gateway. A policy can do well on one and badly
+    on the other.
+    """
+    names = [t.tenant_id for t in tenants]
+    policies = ["fifo", "drr"]
+    labels = {"fifo": "FIFO (baseline)", "drr": "weighted fair"}
+    colours = {"fifo": "#b0b0b0", "drr": "#3572b0"}
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.4))
+    x = np.arange(len(names))
+    width = 0.36
+
+    for i, policy in enumerate(policies):
+        shares = [results[policy]["token_share"][n] * 100 for n in names]
+        ax1.bar(x + (i - 0.5) * width, shares, width,
+                label=labels[policy], color=colours[policy])
+
+    # Entitlement for the backlogged tenants, expressed on the same axis as the
+    # bars. A tenant asking for less than its share takes what it wants first;
+    # what remains is what the backlogged tenants are actually competing over,
+    # and that is what weight divides. Drawing the line as a share of contended
+    # capacity instead would make an on-target bar look short by exactly the
+    # amount the light tenant consumed.
+    backlogged = [t for t in tenants if t.backlogged]
+    total_weight = sum(t.weight for t in backlogged)
+    contended = 100.0 - sum(
+        results["drr"]["token_share"][t.tenant_id] * 100
+        for t in tenants if not t.backlogged
+    )
+    for t in backlogged:
+        idx = names.index(t.tenant_id)
+        target = t.weight / total_weight * contended
+        ax1.plot([idx - 0.42, idx + 0.42], [target, target], "--", color="#c04040", lw=1.6,
+                 label="weighted entitlement" if t is backlogged[0] else None)
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names)
+    ax1.set_ylabel("share of output tokens (%)")
+    ax1.set_title("Who got the capacity")
+    ax1.legend(fontsize=8)
+    ax1.grid(alpha=0.3, axis="y")
+
+    for i, policy in enumerate(policies):
+        waits = [results[policy]["tenants"][n]["queue_wait_p95_ms"] for n in names]
+        ax2.bar(x + (i - 0.5) * width, waits, width,
+                label=labels[policy], color=colours[policy])
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(names)
+    ax2.set_ylabel("queue wait p95 (ms)")
+    ax2.set_yscale("symlog", linthresh=10)
+    ax2.set_title("How long each tenant waited for capacity")
+    ax2.legend(fontsize=8, loc="lower right")
+    ax2.grid(alpha=0.3, axis="y")
+
+    fig.suptitle("Multi-tenant fairness under sustained backlog")
+    return _save(fig, path)

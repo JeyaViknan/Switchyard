@@ -1,0 +1,46 @@
+# Switchyard configuration.
+#
+# The keys below are DEVELOPMENT keys, committed deliberately so that a fresh
+# checkout can issue a request without a setup step. They are minted against the
+# built-in development pepper and are worthless anywhere that sets
+# SWITCHYARD_KEY_PEPPER. Mint real ones with:
+#
+#     python -m switchyard.core.auth <tenant-id>
+
+[gateway]
+# Total requests that may be in flight to providers at once. This is the scarce
+# resource the scheduler allocates -- set it to what the upstream can absorb,
+# not to what the gateway can hold open.
+max_concurrency = 24
+scheduling_policy = "drr"   # "drr" for weighted fair sharing, "fifo" for the baseline
+
+# A large tenant with a guaranteed floor and most of the contended share.
+[[tenants]]
+id = "acme"
+key_sha256 = "f7b33cfa621ab5b927dea4a0f641357da8cc1c8149003a54523a4ec43270dd0b"
+weight = 3.0
+reserved_concurrency = 6
+max_concurrency = 18
+budget_tokens = 2_000_000
+max_queue_depth = 256
+deadline_s = 30.0
+
+# A smaller tenant. Its floor is what protects it from acme.
+[[tenants]]
+id = "globex"
+key_sha256 = "bef8856b7bd67fde08d3b2f960fb92e806782d3680ee2c649fa4026862a2381e"
+weight = 1.0
+reserved_concurrency = 4
+max_concurrency = 12
+budget_tokens = 500_000
+deadline_s = 30.0
+
+# A tenant on a tight budget, for exercising budget exhaustion.
+[[tenants]]
+id = "initech"
+key_sha256 = "a97c099ed7381510e0f2f27169efe90fcc8eb8fa58b3f3b8d8eb9201019100c5"
+weight = 1.0
+reserved_concurrency = 2
+max_concurrency = 8
+budget_tokens = 50_000
+deadline_s = 15.0
