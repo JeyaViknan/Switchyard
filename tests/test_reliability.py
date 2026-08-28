@@ -46,7 +46,8 @@ async def post(gw, tenant, body=None, **kw):
 
 async def scheduler_stats(gw) -> dict:
     async with httpx.AsyncClient(timeout=5.0) as c:
-        return (await c.get(f"{gw.base_url}/v1/scheduler/stats")).json()
+        return (await c.get(f"{gw.base_url}/v1/scheduler/stats",
+                            headers=gw.admin())).json()
 
 
 def break_provider(fleet, name: str, **faults) -> None:
@@ -232,8 +233,8 @@ async def test_a_persistently_failing_provider_is_taken_out_of_rotation(fleet_se
             assert (await post(gw, "alpha")).status_code == 200
 
         async with httpx.AsyncClient() as c:
-            metrics = (await c.get(f"{gw.base_url}/metrics")).text
-            health = (await c.get(f"{gw.base_url}/v1/providers")).json()
+            metrics = (await c.get(f"{gw.base_url}/metrics", headers=gw.admin())).text
+            health = (await c.get(f"{gw.base_url}/v1/providers", headers=gw.admin())).json()
 
     assert health["quick"]["state"] == "open", "the failing provider should be shut out"
     assert health["held"]["state"] == "closed"
@@ -249,10 +250,10 @@ async def test_an_open_breaker_stops_calling_the_failing_provider(fleet_server):
         for _ in range(8):
             await post(gw, "alpha")
         async with httpx.AsyncClient() as c:
-            before = (await c.get(f"{gw.base_url}/metrics")).text
+            before = (await c.get(f"{gw.base_url}/metrics", headers=gw.admin())).text
             for _ in range(5):
                 await post(gw, "alpha")
-            after = (await c.get(f"{gw.base_url}/metrics")).text
+            after = (await c.get(f"{gw.base_url}/metrics", headers=gw.admin())).text
 
     def skipped(text: str) -> float:
         for line in text.splitlines():
@@ -273,7 +274,7 @@ async def test_a_caller_error_does_not_open_the_breaker_for_everyone(fleet_serve
         for _ in range(6):
             await post(gw, "alpha")
         async with httpx.AsyncClient() as c:
-            health = (await c.get(f"{gw.base_url}/v1/providers")).json()
+            health = (await c.get(f"{gw.base_url}/v1/providers", headers=gw.admin())).json()
 
     assert health["quick"]["state"] == "closed"
 
@@ -281,7 +282,7 @@ async def test_a_caller_error_does_not_open_the_breaker_for_everyone(fleet_serve
 async def test_providers_endpoint_describes_routes_and_health(fleet_server):
     config, keys = routed_config()
     async with serve_gateway(config, fleet_server, keys) as gw, httpx.AsyncClient() as c:
-        health = (await c.get(f"{gw.base_url}/v1/providers")).json()
+        health = (await c.get(f"{gw.base_url}/v1/providers", headers=gw.admin())).json()
     assert set(health) == {"quick", "held"}
     assert health["quick"]["state"] == "closed"
 
@@ -318,4 +319,55 @@ async def test_health_reports_503_while_draining_so_load_balancers_back_off(
 async def _drain_gateway(gw) -> None:
     """Reach into the running app to start a drain without stopping the server."""
     async with httpx.AsyncClient(timeout=5.0) as c:
-        await c.post(f"{gw.base_url}/v1/admin/drain")
+        await c.post(f"{gw.base_url}/v1/admin/drain", headers=gw.admin())
+
+
+# -- operational endpoint protection ---------------------------------------
+
+
+OPERATIONAL = ["/metrics", "/v1/providers", "/v1/scheduler/stats"]
+
+
+@pytest.mark.parametrize("path", OPERATIONAL)
+async def test_operational_endpoints_reject_unauthenticated_callers(path, fleet_server):
+    """These carry every tenant's usage, so no tenant may read them."""
+    config, keys = routed_config()
+    async with serve_gateway(config, fleet_server, keys) as gw, httpx.AsyncClient() as c:
+        anonymous = await c.get(f"{gw.base_url}{path}")
+        as_tenant = await c.get(f"{gw.base_url}{path}", headers=gw.auth("alpha"))
+        as_admin = await c.get(f"{gw.base_url}{path}", headers=gw.admin())
+
+    assert anonymous.status_code == 401
+    assert as_tenant.status_code == 401, "a tenant key must not unlock operations"
+    assert as_admin.status_code == 200
+
+
+async def test_drain_cannot_be_triggered_without_the_admin_key(fleet_server):
+    """Otherwise one unauthenticated request takes the gateway out of service."""
+    config, keys = routed_config()
+    async with serve_gateway(config, fleet_server, keys) as gw, httpx.AsyncClient() as c:
+        refused = await c.post(f"{gw.base_url}/v1/admin/drain")
+        still_serving = await post(gw, "alpha")
+
+    assert refused.status_code == 401
+    assert still_serving.status_code == 200, "the refused drain must not have taken effect"
+
+
+async def test_configuring_tenants_without_an_admin_key_fails_closed(fleet_server):
+    """An endpoint that can drain the gateway should not default to open."""
+    from dataclasses import replace
+
+    config, keys = routed_config()
+    config = replace(config, admin_key_sha256=None)
+    async with serve_gateway(config, fleet_server, keys) as gw, httpx.AsyncClient() as c:
+        r = await c.get(f"{gw.base_url}/v1/scheduler/stats", headers=gw.admin())
+
+    assert r.status_code == 401
+    assert "admin_key_sha256" in r.text, "the error should say how to fix it"
+
+
+async def test_open_mode_leaves_operational_endpoints_reachable(gateway_server):
+    """A fresh checkout with no tenants configured must work without setup."""
+    async with httpx.AsyncClient() as c:
+        for path in OPERATIONAL:
+            assert (await c.get(f"{gateway_server.base_url}{path}")).status_code == 200

@@ -31,7 +31,13 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from switchyard.adapters.synthetic import SyntheticAdapter, build_client
-from switchyard.core.auth import AuthError, TenantRegistry, bearer_from_header
+from switchyard.core.auth import (
+    AdminAuthError,
+    AuthError,
+    TenantRegistry,
+    authenticate_admin,
+    bearer_from_header,
+)
 from switchyard.core.budget import BudgetExceeded, BudgetLedger
 from switchyard.core.config import DEFAULT_CONFIG_PATH, GatewayConfig, Tenant, load_config
 from switchyard.core.health import BreakerState, HealthRegistry
@@ -315,6 +321,17 @@ def create_app(
 
     app = FastAPI(title="Switchyard", lifespan=lifespan)
 
+    def require_admin(request: Request) -> None:
+        """Guard the operational endpoints. See core.auth.authenticate_admin."""
+        try:
+            authenticate_admin(
+                bearer_from_header(request.headers.get("authorization")),
+                config.admin_key_sha256,
+                required=auth_required,
+            )
+        except AdminAuthError as exc:
+            raise HTTPException(401, str(exc)) from None
+
     def resolve_tenant(request: Request) -> Tenant:
         if not auth_required:
             return OPEN_TENANT
@@ -435,7 +452,8 @@ def create_app(
         )
 
     @app.get("/v1/scheduler/stats")
-    async def scheduler_stats() -> dict[str, Any]:
+    async def scheduler_stats(request: Request) -> dict[str, Any]:
+        require_admin(request)
         """Live scheduler state. Useful for a demo and for debugging a stuck queue."""
         stats = scheduler.stats()
         return {
@@ -462,7 +480,8 @@ def create_app(
         }
 
     @app.post("/v1/admin/drain")
-    async def start_drain() -> dict[str, Any]:
+    async def start_drain(request: Request) -> dict[str, Any]:
+        require_admin(request)
         """Begin draining without stopping the process.
 
         Shutdown normally drains from the lifespan hook, but doing it on demand
@@ -479,7 +498,8 @@ def create_app(
         }
 
     @app.get("/v1/providers")
-    async def providers_health() -> dict[str, Any]:
+    async def providers_health(request: Request) -> dict[str, Any]:
+        require_admin(request)
         """Per-provider breaker state, error breakdown, and observed latency.
 
         The first place to look when requests are failing: it separates "this
@@ -494,7 +514,10 @@ def create_app(
         return snapshot
 
     @app.get("/metrics")
-    async def metrics() -> Response:
+    async def metrics(request: Request) -> Response:
+        # Protected for the same reason as /v1/scheduler/stats: the series are
+        # labelled per tenant, so they carry every tenant's usage and budget.
+        require_admin(request)
         publish_scheduler_gauges()
         return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
@@ -519,5 +542,3 @@ def create_app(
 
     return app
 
-
-app = create_app()

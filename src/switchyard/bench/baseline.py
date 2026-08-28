@@ -120,7 +120,7 @@ async def run(
 ) -> list[dict]:
     fleet = Service("switchyard.synthetic.app:app")
     gateway = Service(
-        "switchyard.gateway.app:app",
+        "switchyard.gateway.app:create_app", factory=True,
         env={"SWITCHYARD_FLEET_URL": fleet.base_url},
     )
 

@@ -132,6 +132,11 @@ class GatewayConfig:
     max_concurrency: int = 32
     scheduling_policy: str = "drr"
     tenants: tuple[Tenant, ...] = ()
+    # Credential for the operational endpoints: /metrics, /v1/providers,
+    # /v1/scheduler/stats and /v1/admin/*. Separate from tenant keys because
+    # these expose every tenant's usage and can take the gateway out of service,
+    # which is not something one tenant should be able to do to the others.
+    admin_key_sha256: str | None = None
     fleet_url: str = "http://127.0.0.1:8100"
     providers: tuple[str, ...] = ("fast", "slow")
     timeouts: TimeoutPolicy = TimeoutPolicy()
@@ -147,6 +152,8 @@ class GatewayConfig:
             raise ConfigError("gateway.max_concurrency must be >= 1")
         if self.drain_timeout_s < 0:
             raise ConfigError("gateway.drain_timeout_s must be >= 0")
+        if self.admin_key_sha256 is not None and len(self.admin_key_sha256) != 64:
+            raise ConfigError("gateway.admin_key_sha256 must be a 64-char hex digest")
         self.timeouts.validate()
         from switchyard.core.health import BreakerPolicy
 
@@ -216,7 +223,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> GatewayConfig:
     tenants = tuple(_tenant_from_toml(dict(t)) for t in raw.get("tenants", []))
 
     known = {"max_concurrency", "scheduling_policy", "fleet_url", "providers",
-             "drain_timeout_s"}
+             "drain_timeout_s", "admin_key_sha256"}
     unknown = set(gateway_raw) - known
     if unknown:
         raise ConfigError(f"[gateway]: unknown field(s) {sorted(unknown)}")

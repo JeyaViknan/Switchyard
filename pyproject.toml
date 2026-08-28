@@ -17,6 +17,9 @@ dependencies = [
     "numpy",
 ]
 
+[project.scripts]
+switchyard = "switchyard.cli.main:main"
+
 [project.optional-dependencies]
 # Analysis is only needed to turn benchmark runs into figures. Kept out of the
 # gateway's runtime deps so the service image stays small.
@@ -30,6 +33,11 @@ packages = ["src/switchyard"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error::DeprecationWarning"]
+# Scenario end-to-end tests start real servers and drive seconds of load, so
+# they are excluded by default to keep the edit-test loop fast. `make test-all`
+# runs everything.
+addopts = "-m 'not slow'"
+markers = ["slow: starts real services and runs load; excluded from the default run"]
 
 [tool.ruff]
 line-length = 100

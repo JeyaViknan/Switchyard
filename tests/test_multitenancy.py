@@ -26,7 +26,8 @@ async def post(gw, tenant: str | None, body: dict, **kw) -> httpx.Response:
 
 async def stats(gw) -> dict:
     async with httpx.AsyncClient(timeout=5.0) as c:
-        return (await c.get(f"{gw.base_url}/v1/scheduler/stats")).json()
+        return (await c.get(f"{gw.base_url}/v1/scheduler/stats",
+                            headers=gw.admin())).json()
 
 
 # -- authentication --------------------------------------------------------
@@ -65,7 +66,8 @@ async def test_open_mode_serves_without_a_key(gateway_server):
 async def test_work_is_accounted_to_the_authenticated_tenant(tenant_gateway):
     await post(tenant_gateway, "alpha", BODY)
     async with httpx.AsyncClient() as c:
-        metrics = (await c.get(f"{tenant_gateway.base_url}/metrics")).text
+        metrics = (await c.get(f"{tenant_gateway.base_url}/metrics",
+                                headers=tenant_gateway.admin())).text
     assert 'switchyard_tenant_tokens_total{tenant="alpha"}' in metrics
     assert 'switchyard_dispatched_total{tenant="alpha"}' in metrics
 

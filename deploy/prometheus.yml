@@ -7,5 +7,9 @@ global:
 
 scrape_configs:
   - job_name: switchyard-gateway
+    # /metrics is protected because its series are labelled per tenant and so
+    # carry every tenant's usage and budget position.
+    authorization:
+      credentials: "sk_sy_admin_672e27a104b9ede9182f129f4b288395"
     static_configs:
       - targets: ["gateway:8000"]

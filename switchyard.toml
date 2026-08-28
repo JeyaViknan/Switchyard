@@ -17,6 +17,13 @@
 max_concurrency = 24
 scheduling_policy = "drr"   # "drr" for weighted fair sharing, "fifo" for the baseline
 
+# Credential for the operational endpoints (/metrics, /v1/providers,
+# /v1/scheduler/stats, /v1/admin/*). Separate from tenant keys: these expose
+# every tenant's usage and can drain the gateway, so no single tenant should
+# hold them. Development key, like the tenant keys below.
+#   sk_sy_admin_672e27a104b9ede9182f129f4b288395
+admin_key_sha256 = "a9f76f1a903a4dc58af571e1fc2294e3de0f1e033de4469bafb0962fbd853926"
+
 [routes]
 fast = ["fast", "slow"]     # if "fast" is failing, fall back to "slow"
 slow = ["slow"]

@@ -21,28 +21,13 @@ services:
   gateway:
     build: .
     command: >
-      uvicorn switchyard.gateway.app:app --host 0.0.0.0 --port 8000
-      --loop uvloop --http httptools --no-access-log
+      uvicorn switchyard.gateway.app:create_app --factory
+      --host 0.0.0.0 --port 8000 --loop uvloop --http httptools --no-access-log
     environment:
       SWITCHYARD_FLEET_URL: http://fleet:8100
     ports: ["8000:8000"]
     depends_on:
       fleet: {condition: service_healthy}
-
-  # Staged for the tenancy and accounting work. Nothing connects to these yet;
-  # they are here so the stack does not change shape mid-project.
-  redis:
-    image: redis:7-alpine
-    command: redis-server --save "" --appendonly no
-    ports: ["6379:6379"]
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_PASSWORD: switchyard
-      POSTGRES_USER: switchyard
-      POSTGRES_DB: switchyard
-    ports: ["5432:5432"]
 
   prometheus:
     image: prom/prometheus:latest

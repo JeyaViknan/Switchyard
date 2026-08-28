@@ -33,7 +33,7 @@ class Service:
     """A uvicorn subprocess."""
 
     def __init__(self, app: str, port: int | None = None,
-                 env: dict[str, str] | None = None) -> None:
+                 env: dict[str, str] | None = None, factory: bool = False) -> None:
         self.port = port or free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self._proc = subprocess.Popen(
@@ -41,6 +41,7 @@ class Service:
                 sys.executable, "-m", "uvicorn", app,
                 "--host", "127.0.0.1", "--port", str(self.port),
                 "--log-level", "error", "--no-access-log",
+                *(["--factory"] if factory else []),
             ],
             env={**os.environ, **(env or {})},
             stdout=subprocess.DEVNULL,
@@ -77,7 +78,7 @@ class Stack:
     def __init__(self, gateway_env: dict[str, str] | None = None) -> None:
         self.fleet = Service("switchyard.synthetic.app:app")
         self.gateway = Service(
-            "switchyard.gateway.app:app",
+            "switchyard.gateway.app:create_app", factory=True,
             env={"SWITCHYARD_FLEET_URL": self.fleet.base_url, **(gateway_env or {})},
         )
 

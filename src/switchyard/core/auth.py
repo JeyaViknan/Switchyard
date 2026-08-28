@@ -38,6 +38,11 @@ def hash_key(raw_key: str, *, with_pepper: str | None = None) -> str:
     return hashlib.sha256(f"{raw_key}{with_pepper or pepper()}".encode()).hexdigest()
 
 
+def mint_admin_key() -> tuple[str, str]:
+    """Generate an operational credential. Returns (raw_key, sha256_digest)."""
+    return mint_key(ADMIN_ID)
+
+
 def mint_key(tenant_id: str) -> tuple[str, str]:
     """Generate a key for a tenant. Returns (raw_key, sha256_digest).
 
@@ -53,6 +58,34 @@ def tenant_id_from_key(raw_key: str) -> str | None:
     if len(parts) < 4 or f"{parts[0]}_{parts[1]}" != KEY_PREFIX:
         return None
     return "_".join(parts[2:-1]) or None
+
+
+ADMIN_ID = "admin"
+
+
+class AdminAuthError(Exception):
+    """Operational endpoint access was refused."""
+
+
+def authenticate_admin(raw_key: str | None, expected_sha256: str | None,
+                       *, required: bool) -> None:
+    """Guard the operational endpoints.
+
+    When no tenants are configured the gateway is in open development mode and
+    these are open too, so a fresh checkout works without setup. As soon as real
+    tenants exist the endpoints are protected, and a deployment that configured
+    tenants but no admin key is refused rather than silently left open -- an
+    endpoint that can drain the gateway should fail closed.
+    """
+    if not required:
+        return
+    if not expected_sha256:
+        raise AdminAuthError(
+            "operational endpoints are disabled: set gateway.admin_key_sha256 "
+            "in your config (mint one with `switchyard keys mint --admin`)"
+        )
+    if not raw_key or not hmac.compare_digest(hash_key(raw_key), expected_sha256):
+        raise AdminAuthError("invalid admin key")
 
 
 class AuthError(Exception):

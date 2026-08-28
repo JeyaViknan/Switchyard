@@ -105,13 +105,18 @@ class TenantGateway(RunningGateway):
     def auth(self, tenant_id: str) -> dict[str, str]:
         return {"authorization": f"Bearer {self.keys[tenant_id]}"}
 
+    def admin(self) -> dict[str, str]:
+        """Credential for the operational endpoints."""
+        return {"authorization": f"Bearer {self.keys['__admin__']}"}
+
 
 def build_tenant_config(max_concurrency: int = 4, policy: str = "drr", **tenant_over):
     """Config with two tenants, returning it alongside their raw keys."""
-    from switchyard.core.auth import mint_key
+    from switchyard.core.auth import mint_admin_key, mint_key
     from switchyard.core.config import GatewayConfig, Tenant
 
-    keys: dict[str, str] = {}
+    admin_raw, admin_digest = mint_admin_key()
+    keys: dict[str, str] = {"__admin__": admin_raw}
     tenants = []
     for tid, over in (("alpha", {}), ("beta", {})):
         raw, digest = mint_key(tid)
@@ -119,7 +124,8 @@ def build_tenant_config(max_concurrency: int = 4, policy: str = "drr", **tenant_
         tenants.append(Tenant(id=tid, key_sha256=digest, **(over | tenant_over)))
 
     config = GatewayConfig(
-        max_concurrency=max_concurrency, scheduling_policy=policy, tenants=tuple(tenants)
+        max_concurrency=max_concurrency, scheduling_policy=policy, tenants=tuple(tenants),
+        admin_key_sha256=admin_digest,
     )
     config.validate()
     return config, keys
