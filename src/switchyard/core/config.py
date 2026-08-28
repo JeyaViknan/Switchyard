@@ -15,7 +15,7 @@ numbers would be stale the week after they were written.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +76,50 @@ class Tenant:
 
 
 @dataclass(frozen=True, slots=True)
+class TimeoutPolicy:
+    """Four deadlines, because "slow" is not one failure mode.
+
+    A single overall timeout cannot tell a provider that never answered from one
+    that answered promptly and then stalled, and it makes both wait the full
+    duration before anyone notices. Splitting them turns each into a distinct,
+    quickly-detected, differently-handled failure.
+
+    `ttft_s` is the important one. A failure before the first token has reached
+    the client can be retried on another provider completely invisibly; after
+    the first token it cannot. Keeping this deadline tight deliberately pushes
+    failure mass into the window where recovery is still transparent.
+    """
+
+    connect_s: float = 2.0
+    ttft_s: float = 8.0
+    inter_token_s: float = 10.0
+    total_s: float = 300.0
+
+    def validate(self) -> None:
+        for name in ("connect_s", "ttft_s", "inter_token_s", "total_s"):
+            if getattr(self, name) <= 0:
+                raise ConfigError(f"timeouts.{name} must be > 0")
+        if self.total_s < self.ttft_s:
+            raise ConfigError(
+                f"timeouts.total_s ({self.total_s}) is below ttft_s ({self.ttft_s}): "
+                f"the overall deadline would fire before a slow first token could"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class BreakerConfig:
+    """Circuit-breaker tuning, mirrored from core.health.BreakerPolicy."""
+
+    failure_threshold: float = 0.5
+    min_samples: int = 10
+    window: int = 50
+    cooldown_s: float = 5.0
+    max_cooldown_s: float = 60.0
+    jitter: float = 0.3
+    half_open_probes: int = 2
+
+
+@dataclass(frozen=True, slots=True)
 class GatewayConfig:
     """Gateway-wide settings.
 
@@ -90,10 +134,32 @@ class GatewayConfig:
     tenants: tuple[Tenant, ...] = ()
     fleet_url: str = "http://127.0.0.1:8100"
     providers: tuple[str, ...] = ("fast", "slow")
+    timeouts: TimeoutPolicy = TimeoutPolicy()
+    breaker: BreakerConfig = BreakerConfig()
+    # How long shutdown waits for in-flight requests before abandoning them.
+    drain_timeout_s: float = 30.0
+    # Ordered failover candidates per model. A model with no entry maps to the
+    # provider of the same name, so single-provider setups need no routes at all.
+    routes: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.max_concurrency < 1:
             raise ConfigError("gateway.max_concurrency must be >= 1")
+        if self.drain_timeout_s < 0:
+            raise ConfigError("gateway.drain_timeout_s must be >= 0")
+        self.timeouts.validate()
+        from switchyard.core.health import BreakerPolicy
+
+        BreakerPolicy(**{f: getattr(self.breaker, f) for f in BreakerConfig.__slots__}).validate()
+        for model, candidates in self.routes.items():
+            if not candidates:
+                raise ConfigError(f"routes.{model} lists no providers")
+            unknown = [c for c in candidates if c not in self.providers]
+            if unknown:
+                raise ConfigError(
+                    f"routes.{model} names provider(s) {unknown} that are not in "
+                    f"gateway.providers {list(self.providers)}"
+                )
         if self.scheduling_policy not in ("drr", "fifo"):
             raise ConfigError(
                 f"gateway.scheduling_policy must be 'drr' or 'fifo', "
@@ -149,12 +215,33 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> GatewayConfig:
     gateway_raw = dict(raw.get("gateway", {}))
     tenants = tuple(_tenant_from_toml(dict(t)) for t in raw.get("tenants", []))
 
-    known = {"max_concurrency", "scheduling_policy", "fleet_url", "providers"}
+    known = {"max_concurrency", "scheduling_policy", "fleet_url", "providers",
+             "drain_timeout_s"}
     unknown = set(gateway_raw) - known
     if unknown:
         raise ConfigError(f"[gateway]: unknown field(s) {sorted(unknown)}")
     if "providers" in gateway_raw:
         gateway_raw["providers"] = tuple(gateway_raw["providers"])
+
+    timeouts_raw = dict(raw.get("timeouts", {}))
+    unknown = set(timeouts_raw) - set(TimeoutPolicy.__slots__)
+    if unknown:
+        raise ConfigError(f"[timeouts]: unknown field(s) {sorted(unknown)}")
+    if timeouts_raw:
+        gateway_raw["timeouts"] = TimeoutPolicy(**timeouts_raw)
+
+    breaker_raw = dict(raw.get("breaker", {}))
+    unknown = set(breaker_raw) - set(BreakerConfig.__slots__)
+    if unknown:
+        raise ConfigError(f"[breaker]: unknown field(s) {sorted(unknown)}")
+    if breaker_raw:
+        gateway_raw["breaker"] = BreakerConfig(**breaker_raw)
+
+    routes_raw = raw.get("routes", {})
+    if routes_raw:
+        gateway_raw["routes"] = {
+            model: tuple(candidates) for model, candidates in routes_raw.items()
+        }
 
     config = GatewayConfig(tenants=tenants, **gateway_raw)
     config.validate()

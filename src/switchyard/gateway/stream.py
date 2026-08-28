@@ -45,7 +45,7 @@ def _frame(request: CompletionRequest, created: int, delta: dict, **extra) -> by
 
 
 async def to_sse(
-    events: AsyncIterator[StreamEvent], request: CompletionRequest, provider: str,
+    events: AsyncIterator[StreamEvent], request: CompletionRequest,
     timeline: RequestTimeline,
 ) -> AsyncIterator[bytes]:
     """Forward normalized events to the client as SSE, always terminating cleanly.
@@ -61,7 +61,7 @@ async def to_sse(
     try:
         async for event in events:
             if isinstance(event, TokenChunk):
-                timeline.on_token(provider)
+                timeline.on_token(timeline.provider)
                 yield _frame(request, created, {"content": event.text})
 
             elif isinstance(event, StreamDone):
@@ -96,11 +96,11 @@ async def to_sse(
                 )
                 yield b"data: [DONE]\n\n"
     finally:
-        timeline.finish(request.model, provider, outcome)
+        timeline.finish(request.model, timeline.provider, outcome)
 
 
 async def collect(
-    events: AsyncIterator[StreamEvent], request: CompletionRequest, provider: str,
+    events: AsyncIterator[StreamEvent], request: CompletionRequest,
     timeline: RequestTimeline,
 ) -> dict:
     """Assemble a non-streaming response from the same stream.
@@ -117,14 +117,14 @@ async def collect(
     try:
         async for event in events:
             if isinstance(event, TokenChunk):
-                timeline.on_token(provider)
+                timeline.on_token(timeline.provider)
                 parts.append(event.text)
             else:
                 terminal = event
                 timeline.mark_provider_done()
     finally:
         outcome = "ok" if isinstance(terminal, StreamDone) else "error"
-        timeline.finish(request.model, provider, outcome)
+        timeline.finish(request.model, timeline.provider, outcome)
 
     text = "".join(parts)
     if isinstance(terminal, StreamDone):

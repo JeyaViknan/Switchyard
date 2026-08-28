@@ -34,22 +34,29 @@ from switchyard.adapters.synthetic import SyntheticAdapter, build_client
 from switchyard.core.auth import AuthError, TenantRegistry, bearer_from_header
 from switchyard.core.budget import BudgetExceeded, BudgetLedger
 from switchyard.core.config import DEFAULT_CONFIG_PATH, GatewayConfig, Tenant, load_config
+from switchyard.core.health import BreakerState, HealthRegistry
 from switchyard.core.prediction import OutputLengthPredictor
+from switchyard.core.routing import ProviderRouter, RouteObserver
 from switchyard.core.scheduler import AdmissionRejected, RejectReason, Scheduler
 from switchyard.gateway.stream import collect, to_sse
 from switchyard.obs.metrics import (
     ADMISSION_REJECTED,
+    BREAKER_STATE,
     BUDGET_REMAINING,
     BUDGET_RESERVED,
     BUDGET_SPENT,
     CAPACITY_UTILISATION,
     DISPATCHED,
+    FAILOVERS,
     MAX_TOKENS_CLAMPED,
     PREDICTION_ERROR,
+    PROVIDER_ERRORS,
+    PROVIDER_SKIPPED,
     QUEUE_DEPTH,
     REGISTRY,
     TENANT_INFLIGHT,
     TENANT_TOKENS,
+    TERMINAL_FAILURES,
     RequestTimeline,
     monitor_event_loop_lag,
 )
@@ -137,12 +144,65 @@ def parse_request(body: dict[str, Any], request_id: str, max_tokens_cap: int) ->
     )
 
 
+_BREAKER_CODE = {BreakerState.CLOSED: 0, BreakerState.HALF_OPEN: 1, BreakerState.OPEN: 2}
+
+
+class MetricsRouteObserver(RouteObserver):
+    """Records one request's routing decisions.
+
+    Built per request so it can also capture which provider actually served the
+    response, which is not known until one answers and may not be the first one
+    tried.
+    """
+
+    __slots__ = ("timeline", "attempts", "failed_over")
+
+    def __init__(self, timeline) -> None:
+        self.timeline = timeline
+        self.attempts = 0
+        self.failed_over = False
+
+    def on_failover(self, request_id, frm, to, reason) -> None:
+        self.failed_over = True
+        FAILOVERS.labels(from_provider=frm, to_provider=to).inc()
+        PROVIDER_ERRORS.labels(provider=frm, error_class=reason.value).inc()
+
+    def on_skipped(self, request_id, provider) -> None:
+        PROVIDER_SKIPPED.labels(provider=provider).inc()
+
+    def on_terminal_failure(self, provider, error_class, mid_stream) -> None:
+        self.timeline.provider = provider
+        PROVIDER_ERRORS.labels(provider=provider, error_class=error_class.value).inc()
+        TERMINAL_FAILURES.labels(
+            provider=provider, error_class=error_class.value,
+            phase="mid_stream" if mid_stream else "pre_first_token",
+        ).inc()
+
+    def on_success(self, provider, attempts) -> None:
+        self.timeline.provider = provider
+        self.attempts = attempts
+
+
 def _budget_error(tenant_id: str, remaining: int, request_id: str) -> JSONResponse:
     return JSONResponse(
         {"error": {"type": "budget_exhausted", "tenant": tenant_id,
                    "remaining_tokens": remaining, "request_id": request_id}},
         status_code=BUDGET_STATUS,
     )
+
+
+def _routing_headers(observer) -> dict[str, str]:
+    """Non-streaming only: which provider served this, and whether it failed over.
+
+    Streaming responses cannot carry it -- headers are sent before a provider has
+    answered, which is precisely the point at which failover can still happen.
+    """
+    headers = {}
+    if observer.timeline.provider != "-":
+        headers["x-switchyard-provider"] = observer.timeline.provider
+    if observer.failed_over:
+        headers["x-switchyard-failed-over"] = "true"
+    return headers
 
 
 def _response_headers(lease, reservation) -> dict[str, str]:
@@ -207,6 +267,7 @@ def create_app(
 
     scheduler = Scheduler(config, on_dispatch=on_dispatch, on_reject=on_reject)
     ledger = BudgetLedger.from_tenants(config.tenants)
+    provider_health = HealthRegistry(providers, config.breaker)
 
     def publish_scheduler_gauges() -> None:
         stats = scheduler.stats()
@@ -216,6 +277,10 @@ def create_app(
             TENANT_INFLIGHT.labels(tenant=tenant_id).set(
                 stats.per_tenant_inflight.get(tenant_id, 0)
             )
+        for name, snapshot in provider_health.snapshot().items():
+            BREAKER_STATE.labels(provider=name).set(
+                _BREAKER_CODE[BreakerState(snapshot["state"])]
+            )
         for tenant_id, budget in ledger.snapshot().items():
             if budget["limit"] is not None:
                 BUDGET_REMAINING.labels(tenant=tenant_id).set(budget["available"] or 0)
@@ -223,21 +288,29 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        client = build_client(max_connections=max(1000, config.max_concurrency * 4))
+        client = build_client(
+            max_connections=max(1000, config.max_concurrency * 4), timeouts=config.timeouts
+        )
         app.state.client = client
         app.state.config = config
         app.state.scheduler = scheduler
         app.state.predictor = predictor
         app.state.ledger = ledger
-        app.state.adapters = {
-            name: SyntheticAdapter(name, fleet_url, client) for name in providers
+        adapters = {
+            name: SyntheticAdapter(name, fleet_url, client, config.timeouts)
+            for name in providers
         }
+        app.state.adapters = adapters
+        app.state.router = ProviderRouter(adapters, config.routes, provider_health)
+        app.state.provider_health = provider_health
         lag_task = asyncio.create_task(monitor_event_loop_lag())
         try:
             yield
         finally:
             lag_task.cancel()
-            await scheduler.close()
+            # Refuse queued work immediately, let running streams finish.
+            result = await scheduler.drain(config.drain_timeout_s)
+            app.state.drain_result = result
             await client.aclose()
 
     app = FastAPI(title="Switchyard", lifespan=lifespan)
@@ -259,8 +332,8 @@ def create_app(
         request_id = request.headers.get("x-switchyard-request-id") or f"sy-{uuid.uuid4().hex[:12]}"
         parsed = parse_request(await request.json(), request_id, tenant.max_tokens_cap)
 
-        adapter = request.app.state.adapters.get(parsed.model)
-        if adapter is None:
+        router: ProviderRouter = request.app.state.router
+        if not router.knows(parsed.model):
             raise HTTPException(404, f"unknown model {parsed.model!r}")
 
         # Cheap, non-binding budget check before the request is allowed to
@@ -317,12 +390,13 @@ def create_app(
             publish_scheduler_gauges()
 
         headers = _response_headers(lease, reservation)
+        observer = MetricsRouteObserver(timeline)
 
         if not parsed.stream:
             async with stack:
-                payload = await collect(adapter.stream(parsed), parsed, adapter.name, timeline)
+                payload = await collect(router.stream(parsed, observer), parsed, timeline)
                 finish(int(payload["usage"]["completion_tokens"]))
-            return JSONResponse(payload, headers=headers)
+            return JSONResponse(payload, headers=headers | _routing_headers(observer))
 
         async def body_iter():
             # The stack owns both the capacity lease and the budget reservation.
@@ -331,7 +405,7 @@ def create_app(
             async with stack:
                 try:
                     async for frame in to_sse(
-                        adapter.stream(parsed), parsed, adapter.name, timeline
+                        router.stream(parsed, observer), parsed, timeline
                     ):
                         yield frame
                 finally:
@@ -377,18 +451,60 @@ def create_app(
             },
         }
 
+    @app.post("/v1/admin/drain")
+    async def start_drain() -> dict[str, Any]:
+        """Begin draining without stopping the process.
+
+        Shutdown normally drains from the lifespan hook, but doing it on demand
+        is what makes the behaviour demonstrable and testable: a deploy can mark
+        the instance unready, watch in-flight work finish, and only then stop it.
+        """
+        result = await scheduler.drain(config.drain_timeout_s)
+        return {
+            "drained_cleanly": result.clean,
+            "queued_rejected": result.queued_rejected,
+            "inflight_at_start": result.inflight_at_start,
+            "inflight_remaining": result.inflight_remaining,
+            "waited_s": round(result.waited_s, 3),
+        }
+
+    @app.get("/v1/providers")
+    async def providers_health() -> dict[str, Any]:
+        """Per-provider breaker state, error breakdown, and observed latency.
+
+        The first place to look when requests are failing: it separates "this
+        provider is broken" from "everything is broken" without reading metrics.
+        """
+        snapshot = provider_health.snapshot()
+        for name, entry in snapshot.items():
+            entry["routes_serving"] = [
+                model for model in ({*config.routes, *providers})
+                if name in app.state.router.candidates(model)
+            ]
+        return snapshot
+
     @app.get("/metrics")
     async def metrics() -> Response:
         publish_scheduler_gauges()
         return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/health")
-    async def health() -> dict[str, Any]:
+    async def health(response: Response) -> dict[str, Any]:
+        """Readiness, not liveness.
+
+        Returns 503 while draining so a load balancer stops sending new traffic
+        while in-flight requests are still being finished. The process is still
+        working -- it just should not be given anything more.
+        """
+        draining = scheduler.draining
+        if draining:
+            response.status_code = 503
         return {
-            "status": "ok",
+            "status": "draining" if draining else "ok",
             "auth": "required" if auth_required else "disabled (no tenants configured)",
             "policy": config.scheduling_policy,
             "max_concurrency": config.max_concurrency,
+            "inflight": scheduler.stats().inflight,
         }
 
     return app

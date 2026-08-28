@@ -157,6 +157,40 @@ MAX_TOKENS_CLAMPED = Counter(
     ["tenant"], registry=REGISTRY,
 )
 
+PROVIDER_ERRORS = Counter(
+    "switchyard_provider_errors_total",
+    "Provider failures by class. The class is what determines whether the "
+    "failure is recoverable and whether it counts against provider health.",
+    ["provider", "error_class"], registry=REGISTRY,
+)
+
+FAILOVERS = Counter(
+    "switchyard_failovers_total",
+    "Transparent failovers: a provider failed before delivering anything, so "
+    "another served the request and the client never knew.",
+    ["from_provider", "to_provider"], registry=REGISTRY,
+)
+
+TERMINAL_FAILURES = Counter(
+    "switchyard_terminal_failures_total",
+    "Failures the client actually saw, split by whether any tokens had already "
+    "been delivered. Tightening the TTFT deadline should move mass from "
+    "mid_stream to pre_first_token, where recovery is invisible.",
+    ["provider", "error_class", "phase"], registry=REGISTRY,
+)
+
+BREAKER_STATE = Gauge(
+    "switchyard_breaker_state",
+    "Circuit breaker per provider: 0 closed, 1 half-open, 2 open.",
+    ["provider"], registry=REGISTRY,
+)
+
+PROVIDER_SKIPPED = Counter(
+    "switchyard_provider_skipped_total",
+    "Requests not sent to a provider because its breaker was open.",
+    ["provider"], registry=REGISTRY,
+)
+
 PREDICTION_ERROR = Histogram(
     "switchyard_output_prediction_ratio",
     "Actual output tokens divided by the scheduler's estimate. Centred on 1.0 "
@@ -223,11 +257,14 @@ class RequestTimeline:
 
     __slots__ = (
         "arrived_at", "queue_wait_s", "dispatched_at", "first_token_at",
-        "last_token_at", "provider_done_at", "tokens", "tenant_id",
+        "last_token_at", "provider_done_at", "tokens", "tenant_id", "provider",
     )
 
     def __init__(self, tenant_id: str = "-") -> None:
         self.tenant_id = tenant_id
+        # Set once routing picks a provider; unknown until then, and it may
+        # differ from the first one tried if a failover happened.
+        self.provider = "-"
         self.arrived_at = time.perf_counter()
         self.queue_wait_s = 0.0
         self.dispatched_at: float | None = None

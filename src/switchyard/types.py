@@ -43,6 +43,7 @@ class ErrorClass(enum.StrEnum):
     CONNECT = "connect"              # could not establish a connection
     TIMEOUT_TTFT = "timeout_ttft"    # connected, no first token in time
     TIMEOUT_TOKEN = "timeout_token"  # stream stalled mid-flight
+    TIMEOUT_TOTAL = "timeout_total"  # exceeded the overall request lifetime
     RATE_LIMITED = "rate_limited"    # 429
     SERVER_ERROR = "server_error"    # 5xx
     BAD_REQUEST = "bad_request"      # 4xx other than 429
@@ -50,7 +51,25 @@ class ErrorClass(enum.StrEnum):
 
     @property
     def retryable(self) -> bool:
-        return self not in (ErrorClass.BAD_REQUEST,)
+        """Whether trying a different provider could plausibly succeed.
+
+        A malformed request will be malformed everywhere, so retrying it just
+        multiplies the cost of the caller's mistake.
+        """
+        return self is not ErrorClass.BAD_REQUEST
+
+    @property
+    def counts_against_provider(self) -> bool:
+        """Whether this failure is evidence the provider itself is unhealthy.
+
+        Circuit-breaker input. Two exclusions matter. A BAD_REQUEST is the
+        caller's fault, and letting one tenant's malformed requests trip the
+        breaker would take the provider away from everyone else. A TIMEOUT_TOTAL
+        is wall-clock across the whole response including time spent writing to
+        the client, so a slow *consumer* can cause it -- attributing that to the
+        provider would open the breaker for something the provider did right.
+        """
+        return self not in (ErrorClass.BAD_REQUEST, ErrorClass.TIMEOUT_TOTAL)
 
 
 @dataclass(frozen=True, slots=True)

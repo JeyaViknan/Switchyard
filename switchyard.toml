@@ -8,11 +8,34 @@
 #     python -m switchyard.core.auth <tenant-id>
 
 [gateway]
+# Ordered failover candidates. A model with no entry maps to the provider of the
+# same name, so this section is only needed where a fallback exists.
+
 # Total requests that may be in flight to providers at once. This is the scarce
 # resource the scheduler allocates -- set it to what the upstream can absorb,
 # not to what the gateway can hold open.
 max_concurrency = 24
 scheduling_policy = "drr"   # "drr" for weighted fair sharing, "fifo" for the baseline
+
+[routes]
+fast = ["fast", "slow"]     # if "fast" is failing, fall back to "slow"
+slow = ["slow"]
+
+# Four deadlines rather than one, so "slow" is not a single failure mode.
+# ttft_s is the important one: a failure before the first token can be retried on
+# another provider invisibly, so keeping this tight pushes failure mass into the
+# window where recovery is transparent.
+[timeouts]
+connect_s = 2.0
+ttft_s = 8.0
+inter_token_s = 10.0
+total_s = 300.0
+
+[breaker]
+failure_threshold = 0.5     # trip once half of a meaningful sample is failing
+min_samples = 10            # ... but never on a single unlucky request
+cooldown_s = 5.0            # jittered and doubling on repeated trips
+half_open_probes = 2
 
 # A large tenant with a guaranteed floor and most of the contended share.
 [[tenants]]

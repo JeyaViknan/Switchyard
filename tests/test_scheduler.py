@@ -287,3 +287,89 @@ async def test_uncontended_requests_report_no_meaningful_queue_wait():
     sched = scheduler(4, "drr", t)
     async with sched.acquire(t, 100.0) as lease:
         assert lease.queue_wait_s < 0.01
+
+
+# -- graceful drain --------------------------------------------------------
+
+
+async def test_drain_refuses_queued_work_but_waits_for_running_work():
+    """The asymmetry is the point.
+
+    A queued request has not started, so refusing it costs nothing and the
+    client can go elsewhere at once. A running one has already consumed provider
+    capacity and may have delivered tokens; killing it wastes what was paid for
+    and truncates the answer.
+    """
+    t = tenant("t1", max_queue_depth=10, deadline_s=30.0)
+    sched = scheduler(1, "drr", t)
+    release = asyncio.Event()
+    finished = []
+
+    async def running():
+        async with sched.acquire(t, 100.0):
+            await release.wait()
+            finished.append(True)
+
+    holder = asyncio.create_task(running())
+    await asyncio.sleep(0.02)
+    queued = [asyncio.create_task(hold(sched, t, release)) for _ in range(3)]
+    await asyncio.sleep(0.02)
+
+    drain = asyncio.create_task(sched.drain(timeout_s=5.0))
+    await asyncio.sleep(0.05)
+
+    results = await asyncio.gather(*queued, return_exceptions=True)
+    assert all(isinstance(r, AdmissionRejected) for r in results)
+    assert all(r.reason is RejectReason.SHUTTING_DOWN for r in results)
+    assert not drain.done(), "drain must still be waiting on the running request"
+
+    release.set()
+    await holder
+    result = await drain
+
+    assert finished == [True], "the running request was allowed to finish"
+    assert result.clean is True
+    assert result.queued_rejected == 3
+    assert result.inflight_at_start == 1
+    assert result.inflight_remaining == 0
+
+
+async def test_drain_gives_up_on_a_request_that_never_finishes():
+    """A provider that never returns must not hold shutdown open forever."""
+    t = tenant("t1")
+    sched = scheduler(2, "drr", t)
+    stuck = asyncio.Event()
+
+    async def never_finishes():
+        async with sched.acquire(t, 100.0):
+            await stuck.wait()
+
+    task = asyncio.create_task(never_finishes())
+    await asyncio.sleep(0.02)
+
+    result = await sched.drain(timeout_s=0.1)
+    assert result.clean is False
+    assert result.inflight_remaining == 1
+    assert result.waited_s >= 0.1
+
+    stuck.set()
+    await task
+
+
+async def test_draining_refuses_new_requests():
+    t = tenant("t1")
+    sched = scheduler(4, "drr", t)
+    await sched.drain(timeout_s=0.1)
+    assert sched.draining is True
+
+    with pytest.raises(AdmissionRejected) as exc:
+        async with sched.acquire(t, 100.0):
+            pass
+    assert exc.value.reason is RejectReason.SHUTTING_DOWN
+
+
+async def test_drain_on_an_idle_scheduler_returns_immediately():
+    sched = scheduler(4, "drr", tenant("t1"))
+    result = await sched.drain(timeout_s=30.0)
+    assert result.clean is True
+    assert result.waited_s < 0.5, "an idle gateway should not wait out the timeout"

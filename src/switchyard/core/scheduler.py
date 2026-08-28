@@ -37,6 +37,7 @@ The cost is one already-resolved future per request.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import time
 from collections.abc import AsyncIterator, Callable
@@ -75,6 +76,20 @@ class Lease:
     actual_tokens: int | None = field(default=None)
 
 
+@dataclass(frozen=True, slots=True)
+class DrainResult:
+    """What happened during shutdown."""
+
+    queued_rejected: int
+    inflight_at_start: int
+    inflight_remaining: int
+    waited_s: float
+
+    @property
+    def clean(self) -> bool:
+        return self.inflight_remaining == 0
+
+
 @dataclass(slots=True)
 class SchedulerStats:
     inflight: int
@@ -111,6 +126,10 @@ class Scheduler:
         self._shared_inflight = 0
         self._waiting: dict[int, asyncio.Future[Lease]] = {}
         self._closed = False
+        # Set whenever nothing is in flight, so a drain can wait on a signal
+        # rather than polling a counter.
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     # -- capacity ---------------------------------------------------------
 
@@ -134,6 +153,7 @@ class Scheduler:
         if from_shared:
             self._shared_inflight += 1
         self._tenant_inflight[tenant_id] = self._inflight(tenant_id) + 1
+        self._idle.clear()
         return from_shared
 
     def _release(self, lease: Lease) -> None:
@@ -152,6 +172,8 @@ class Scheduler:
             self._tenant_inflight[lease.tenant_id] = remaining
         else:
             self._tenant_inflight.pop(lease.tenant_id, None)
+        if not self._tenant_inflight:
+            self._idle.set()
         self._pump()
 
     # -- dispatch ---------------------------------------------------------
@@ -263,15 +285,51 @@ class Scheduler:
         if future.done() and not future.cancelled() and future.exception() is None:
             self._release(future.result())
 
-    async def close(self) -> None:
-        """Stop admitting and fail everything still queued."""
+    @property
+    def draining(self) -> bool:
+        return self._closed
+
+    async def drain(self, timeout_s: float = 30.0) -> DrainResult:
+        """Stop admitting, refuse what is queued, and let in-flight work finish.
+
+        The asymmetry between queued and in-flight requests is the point. A
+        queued request has not started, so refusing it costs nothing and the
+        client can retry elsewhere immediately. An in-flight request has already
+        consumed provider capacity and may have delivered tokens; killing it
+        wastes what was paid for and hands the client a truncated answer. So
+        queued work is rejected at once and running work is waited for.
+
+        The wait is bounded. A provider that never finishes would otherwise hold
+        shutdown open indefinitely, so past the timeout the remaining requests
+        are abandoned and reported rather than silently waited on.
+        """
+        started = self._clock()
         self._closed = True
+
+        queued = 0
         for seq, future in list(self._waiting.items()):
             if not future.done():
                 future.set_exception(
                     AdmissionRejected(RejectReason.SHUTTING_DOWN, "gateway is shutting down")
                 )
+                queued += 1
             self._waiting.pop(seq, None)
+
+        inflight_at_start = sum(self._tenant_inflight.values())
+        if inflight_at_start:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._idle.wait(), timeout=timeout_s)
+
+        return DrainResult(
+            queued_rejected=queued,
+            inflight_at_start=inflight_at_start,
+            inflight_remaining=sum(self._tenant_inflight.values()),
+            waited_s=self._clock() - started,
+        )
+
+    async def close(self) -> None:
+        """Immediate stop: refuse queued work, do not wait for anything running."""
+        await self.drain(timeout_s=0.0)
 
     def stats(self) -> SchedulerStats:
         return SchedulerStats(
