@@ -1,395 +1,327 @@
 # Switchyard
 
-An admission controller and fair-share scheduler for LLM inference capacity.
+**An LLM gateway you can break on purpose.**
 
-Switchyard is a scheduler that happens to speak LLM, not a proxy that happens to
-schedule. The problem it exists to solve: **LLM requests are non-fungible units
-of unknown duration and unknown cost.** A request's duration is proportional to
-its output length, which is not knowable before the request runs. Existing
-gateways model requests as fungible units of known cost, so they are forced to
-choose between reserving the declared `max_tokens` ceiling — which idles most of
-the real capacity, because a request declaring 4096 tokens typically emits a few
-hundred — and reserving nothing, which permits budget overruns.
+Switchyard is a self-hostable multi-tenant gateway that schedules scarce
+inference capacity fairly, enforces token budgets, and keeps serving when
+providers fail. It ships with the harness that proves it — break a provider
+mid-traffic, flood one tenant, and watch what happens, with no LLM API key and
+no spend.
 
-Switchyard predicts the output-length distribution, reserves at its p95, settles
-against the actual, and clamps `max_tokens` when a tenant is near its limit so
-the worst case always fits. That converts a probabilistic guarantee into a hard
-one, at the cost of truncating responses near budget exhaustion.
-
-## What this is not
-
-Not a production system. There is no HA, no secrets management, no compliance
-story, no multi-region, and no operational hardening. It is a measured
-demonstration of specific scheduling properties, and the measurements are the
-deliverable.
-
-## Status
-
-Weeks 1-3 of 4 complete: the measurement rig, the scheduler, and reliability.
-
-The rig was built before any gateway feature, deliberately. A benchmark harness
-written after the system it measures tends to be shaped by the results it finds;
-one written first is shaped by the question being asked.
-
-| Component | State |
-|---|---|
-| Synthetic provider fleet | Done — deterministic, runtime fault injection |
-| Open-loop load generator | Done — Poisson arrivals, SSE-aware, per-token timing persisted |
-| Multi-tenant auth and config | Done — API keys, per-tenant weights, floors, ceilings |
-| Admission control and queueing | Done — bounded queues, deadlines, leak-proof leases |
-| Weighted fair scheduling | Done — measured against a FIFO baseline |
-| Token budgets | Done — reserve, settle, clamp, hard spending bound |
-| Timeout decomposition | Done — four deadlines, four error classes |
-| Failover and circuit breaking | Done — measured against a single-provider baseline |
-| Graceful drain | Done — refuses queued work, finishes running work |
-| Semantic-cache experiment, report | Week 4 |
-
-## Why the load generator is open-loop
-
-A closed-loop generator — N workers, each sending its next request when the
-previous returns — cannot offer more load than the system absorbs. When the
-system slows, the generator slows with it, queueing never appears in the
-measurement, and reported latency stays flat right up to the point of collapse.
-That artifact is coordinated omission, and it makes latency numbers wrong in the
-direction that flatters the system.
-
-Switchyard's generator fixes a Poisson arrival schedule up front and fires each
-request at its scheduled time regardless of whether earlier ones have finished.
-Every latency is measured from the request's *intended* start.
-
-An open-loop generator can itself become the bottleneck, so every run reports
-its own health:
-
-- **Scheduling lag** — how late each request actually fired, judged as a *ratio*
-  of median latency rather than a fixed millisecond bar. 20 ms of lag is
-  negligible against a 2 s request and disqualifying against a 50 ms one.
-- **Connection saturation** — if concurrency reaches the client's connection
-  cap, arrivals block on the pool and the run has silently stopped being
-  open-loop.
-- **File-descriptor headroom** — checked before the run starts, so fd exhaustion
-  cannot masquerade as the system under test refusing connections.
-
-The fleet, the gateway, and the generator run in **separate processes**. An
-earlier version ran all three on one event loop, where the generator's own CPU
-work delayed the gateway it was measuring; scheduling lag reached 20 ms at only
-20 rps. With process isolation the same measurement runs at 0.0–2.5% of median
-latency through 40 rps.
-
-Requests scheduled during warmup are issued but excluded from the statistics, so
-connection setup and cold code paths do not land in the reported percentiles.
-
-## Why a synthetic provider fleet
-
-Comparing two scheduling policies is only valid if the provider behaves
-identically under both for the same request. Otherwise the measurement is
-provider noise, not policy effect. Real APIs cannot give that guarantee, cost
-money per run, and rate-limit exactly when throughput is needed.
-
-The fleet draws every per-request decision — time to first token, output length,
-whether this request fails and how — from an RNG seeded by
-`(run_seed, request_id)`, and the load generator derives request ids from
-`(seed, index)` rather than randomly. Both halves are required: with random ids
-the fleet is deterministic but the workload is not, and two runs of one spec
-produce different output lengths. `test_same_seed_reproduces_the_same_workload`
-asserts that two runs return identical per-request output tokens.
-
-Faults are driven at runtime through `/control/*`, so a benchmark can inject a
-provider outage mid-run. Enabling a fault does not perturb the other draws, so a
-faulted run remains comparable to a clean one; that property is also tested.
-
-## Baseline
-
-The gateway is currently a passthrough, so this measures the latency floor:
-transport and pump cost with no scheduling in the path. Single run per rate,
-seed 1, 12 s each with the first 2 s discarded as warmup.
-
-```
-rate=    2  n=  20/22    p50= 2384.9ms  p99= 3298.9ms  ttft_p50= 239.8ms  lag=0.001  peak_conc=  9
-rate=    5  n=  42/49    p50= 2318.4ms  p99= 3355.3ms  ttft_p50= 231.4ms  lag=0.025  peak_conc= 15
-rate=   10  n=  96/116   p50= 1993.4ms  p99= 3354.4ms  ttft_p50= 218.4ms  lag=0.001  peak_conc= 29
-rate=   20  n= 209/239   p50= 2074.3ms  p99= 3349.2ms  ttft_p50= 219.2ms  lag=0.000  peak_conc= 51
-rate=   40  n= 416/486   p50= 2173.8ms  p99= 3403.0ms  ttft_p50= 220.3ms  lag=0.007  peak_conc=105
+```bash
+git clone https://github.com/JeyaViknan/Switchyard && cd Switchyard
+make install
+make scenario noisy-neighbour
 ```
 
-`n` is requests in the measurement window over requests issued; `lag` is p99
-scheduling lag as a fraction of median latency.
+Or the whole story in one command: `make demo`. A recorded run is in
+[docs/demo.md](docs/demo.md).
 
-### How much of that is the gateway?
+---
 
-Measured directly from the gateway's own timing decomposition, pooled across all
-rates above:
+## The problem
 
-```
-gateway_overhead   p50   0.88ms   p95   2.41ms   p99   4.72ms   mean   1.07ms
-provider_time      p50 2123ms     p95 3812ms     p99 3962ms     mean 2169ms
-queue_wait         mean 0.000ms   (structurally zero: no admission control yet)
-```
+Put several tenants behind one set of LLM providers and two things go wrong.
 
-So the gateway accounts for roughly **0.05% of median request time** at these
-settings. This is a direct measurement, not an inference. An earlier version of
-this README compared measured TTFT against the fleet's *configured* TTFT median
-and concluded the gateway "adds close to nothing" — that method does not work.
-Provider TTFT variance (lognormal, σ=0.4) is far larger than the gateway's
-contribution, and running the comparison properly returned **−14 ms**, which is
-impossible and simply means the signal was below the noise floor. Asking the
-gateway what it spent replaces a subtraction of two noisy numbers with one
-measurement.
+**Capacity is not fungible.** A request holds a provider slot for as long as it
+takes to generate, and how long that is depends on output length — which the
+caller does not declare and the model does not promise. Rate limiting by
+requests per second allocates the wrong thing.
 
-### What this baseline does not establish
+**Failure is not uniform.** A provider that is slow, a provider returning 5xx,
+and a provider that answered and then stalled all need different responses. One
+timeout treats them identically and makes all three wait its full duration.
 
-- **No saturation point.** Latency is flat and throughput linear across 2–40 rps
-  because nothing in the passthrough constrains concurrency — peak concurrency
-  only reached 105. Flatness here is a property of the load range, not a
-  finding. There is no knee because there is nothing yet to produce one.
-- **Single run per rate.** No repeats, so no confidence interval. The plan calls
-  for median-of-5; that arrives with the overload experiment.
-- **Short window.** 10 s of measured arrivals per rate. Enough for a floor,
-  not enough for tail behavior at p99.9.
-- **One machine, unpinned.** No CPU isolation; other load on the host will show
-  up in the numbers.
+## What Switchyard does
 
-The overload experiment will need much higher offered load, repeats, and a knee.
-None of that is claimed here.
+- **Weighted fair scheduling** across tenants, measured in **tokens**, with
+  reserved floors that guarantee capacity and ceilings that cap it.
+- **Admission control** with bounded queues and deadlines, so overload sheds
+  load instead of accumulating work nobody is waiting for.
+- **Hard token budgets** — reserve, settle, and clamp `max_tokens` so spend
+  cannot exceed a limit.
+- **Timeout decomposition** into connect / first-token / inter-token / total,
+  each producing a distinct, differently-handled failure.
+- **Phased failover** and circuit breaking that route around a failing provider
+  without ever splicing two answers together.
+- **Graceful drain** that refuses queued work and lets running work finish.
 
-## How scheduling works
+## Why it is different
 
-The scarce resource is concurrent in-flight requests to providers. A request
-holds a slot from dispatch until its stream ends, and how long that takes is not
-knowable in advance.
+Most gateways can be configured. Switchyard can be **interrogated**.
 
-Capacity splits into a reserved pool and a shared pool:
+The synthetic provider fleet and load generator are product features, not test
+scaffolding. That means you can watch the scheduler protect a tenant, watch a
+breaker open, and ask whether *your* configuration actually delivers what it
+promises — in under a minute, with nothing to sign up for.
 
-```
-shared_capacity = max_concurrency - sum(tenant.reserved_concurrency)
-```
+---
 
-A tenant below its own `reserved_concurrency` always has a slot — that floor is
-why a noisy neighbour cannot starve it. Above the floor it competes for the
-shared pool, ordered by weighted fair queueing and capped by its own
-`max_concurrency`. Configuration refuses reserved totals above capacity, because
-guarantees that cannot all be honoured at once are an overdraft, not a floor.
-
-Ordering uses per-tenant virtual clocks: each advances by `cost / weight` on
-dispatch, and the scheduler serves whichever backlogged tenant's clock is
-furthest behind. **Cost is measured in tokens, not requests.** A tenant sending
-4000-token completions consumes roughly ten times the capacity of one sending
-400-token completions at the same request rate; request-count fairness would
-call that fair.
-
-Scheduling has to commit before the real cost is known, so the clock advances on
-a predicted length and is **corrected against the actual** when the lease
-releases. Without that, a tenant whose requests systematically run longer than
-predicted would be under-charged on every one and drift into a permanently
-larger share.
-
-## Fairness under sustained backlog
-
-Three tenants, gateway capacity well below offered load. `interactive` asks for
-less than its share; `noisy` and `premium` are both permanently backlogged, with
-`premium` weighted 3×. The same workload and seed run under both policies, so
-arrivals and provider responses are identical between arms — only the scheduling
-decision differs.
-
-```
---- FIFO (baseline) ---
-tenant         done    tok/s   share  qwait p50  qwait p95  rejected
-interactive      18    107.7    9.2%     19541m     19980m        10
-noisy           107    552.0   46.9%     19514m     19992m       928
-premium          98    516.7   43.9%     19475m     19997m       937
-                        weighted fairness (Jain index): 0.784
-
---- weighted fair ---
-tenant         done    tok/s   share  qwait p50  qwait p95  rejected
-interactive      28    170.3   13.5%        82m       273m         0
-noisy            50    250.9   19.8%     18268m     19984m       985
-premium         144    843.0   66.7%     19433m     19990m       891
-                        weighted fairness (Jain index): 0.997
-```
-
-Two separate results. **Isolation:** the light tenant's median queue wait falls
-from 19.5 s to 82 ms — 238× — and its rejections go from 10 to zero. Under FIFO
-it was stuck behind a flood it had nothing to do with. **Proportionality:** with
-`interactive` taking 13.5%, the 86.5% actually contended should split 21.6% /
-64.9% by weight; measured 19.8% / 66.7%.
-
-The backlogged tenants still wait ~20 s and shed load — correctly. They are
-offering roughly 7× what the gateway can serve, so the bounded queue and
-deadline reject the excess instead of accumulating work nobody is waiting for.
-Fair scheduling decides *who* waits; it does not create capacity.
-
-Reproduce with `make bench-fairness`. A 65 s run at a different seed gives Jain
-0.999 and 95 ms, with the proportionality gap narrowing from ±1.8pp to ±1.1pp —
-consistent with convergence rather than a systematic bias.
-
-## Token budgets
-
-Three quantities the accounting deliberately keeps apart:
-
-| | Source | Used for | Cost of being wrong |
-|---|---|---|---|
-| Estimated work | predicted p50 | ordering the queue | self-corrects on settlement |
-| Reserved budget | the request's `max_tokens` ceiling | held while in flight | none — it is the worst case |
-| Actual consumption | what the provider emitted | charged on completion | — |
-
-The reservation is the **ceiling, not the estimate**. Reserving a predicted
-length would be right most of the time, and "most of the time" is a different
-guarantee for money than for scheduling: a scheduling mis-estimate self-corrects,
-while a budget mis-estimate is tokens already generated and billed. Because a
-request can never emit more than its `max_tokens`, reserving exactly that makes
-`spent + reserved <= limit` hold by construction.
-
-The cost is that a tenant with 500 tokens left cannot start a request declaring
-`max_tokens=4096`. Rather than refuse it, Switchyard **clamps** `max_tokens` to
-the remaining headroom and tells the client via
-`x-switchyard-max-tokens-clamped`. The response may be cut short; the tenant
-never overspends. Below a useful floor the request is refused with **402** —
-not 429, because retrying will never help.
-
-## Reliability
-
-### Four timeouts, not one
-
-A single read deadline cannot tell a provider that never answered from one that
-answered and then stalled, and makes both wait its full duration before anything
-notices. Each deadline produces a distinct error class, because what happens
-next depends on which fired:
-
-| Deadline | Meaning | Default |
-|---|---|---|
-| `connect_s` | could not reach the provider | 2 s |
-| `ttft_s` | connected, no first token | 8 s |
-| `inter_token_s` | was streaming, then stalled | 10 s |
-| `total_s` | whole response took too long | 300 s |
-
-The per-chunk deadlines wrap only the await on the provider, never the yield to
-the client, so backpressure from a slow consumer is not mistaken for a stalled
-provider.
-
-### Failover is phased on what has been delivered
-
-Not on the kind of error — on whether anything already reached the client.
-
-**Before the first token**, nothing has been delivered, so another provider can
-serve the request and the caller never learns the first one failed.
-
-**After the first token**, it cannot. Switching mid-response would splice a
-second continuation onto a partial answer and return corrupted output under a
-success status. A visible error can be retried by the caller; silent corruption
-cannot even be detected. So a mid-stream failure terminates with a typed frame
-carrying `tokens_emitted` — exactly what the client received.
-
-This is why `ttft_s` is deliberately tight: it is the lever that moves failure
-mass out of the unrecoverable window into the one where recovery is invisible.
-`switchyard_terminal_failures_total` is labelled by phase so moving it is
-measurable rather than assumed.
-
-Failover reuses **one** capacity lease and **one** budget reservation. A retry is
-still one request competing for capacity, and since failover only happens at zero
-tokens, there is no output to double-charge.
-
-### Circuit breaking
-
-Rolling-window breaker per provider, with a minimum sample count so one unlucky
-request after a quiet period cannot open it. Cooldown is jittered and doubles on
-repeated trips, so a recovering provider is not hit by a synchronised retry;
-half-open admits a bounded number of probes. Only failures the provider is
-responsible for count — a caller's malformed request fails identically
-everywhere, and a total timeout includes time spent writing to a slow client.
-
-`GET /v1/providers` shows breaker state, error breakdown and observed latency per
-provider.
-
-### Under a real outage
-
-Steady load, one provider returning 5xx from 12 s to 30 s. Same workload and seed
-in both arms; the only difference is whether a fallback exists.
-
-```
-                    during the outage    breaker opened    failovers
-single provider       16/120  (13%)          16.3s             0
-with failover         48/48  (100%)          21.4s            26
-```
-
-Client-visible success during a total provider outage goes from **13% to 100%**.
-
-The latency panel shows the part that is easy to miss. With failover, p99 rises
-from ~3 s to ~10-20 s: requests move to a slower fallback and capacity saturates,
-so surviving the outage is not free. Without failover, p99 *drops* to ~10 ms once
-the breaker opens — the gateway stops paying to rediscover the outage on every
-request, and fast failure is a real improvement over slow failure even when the
-answer is still an error.
-
-Reproduce with `make bench-faults`.
-
-**What is and is not reproducible here.** The during-outage figures above are
-stable across seeds and runs, as are the failover count and the moment the
-breaker first opens. Whole-run completion rate for the single-provider arm is
-*not*: across two runs of the identical scenario it came out 58% and 24%. That
-is the jittered exponential backoff working as designed — whether a half-open
-probe happens to land while the provider is still broken decides how long the
-breaker stays shut afterwards, and that shifts recovery by tens of seconds. It
-is a real property of the system rather than measurement noise, so the headline
-number here is the one that holds.
-
-### Graceful drain
-
-Queued and running work are treated differently. A queued request has not
-started, so refusing it costs nothing and the client can go elsewhere at once. A
-running one has consumed capacity and may have delivered tokens, so killing it
-wastes what was paid for. Queued work is rejected immediately, running work is
-waited for, and the wait is bounded so a provider that never finishes cannot hold
-shutdown open.
-
-`/health` returns 503 while draining — readiness, not liveness: the process still
-works, it just should not be given anything more. `POST /v1/admin/drain` triggers
-it without stopping the process.
-
-## Running it
+## Quickstart
 
 ```bash
 make install
-make check           # lint, types, tests
-make bench-fairness  # the fairness comparison above
-make bench-faults    # the provider-outage recovery timeline
-make bench           # regenerates every figure in plots/
-```
-
-Serve it locally against the committed `switchyard.toml`:
-
-```bash
-make dev
+make dev          # gateway :8000, synthetic providers :8100
 ```
 
 ```bash
-curl -sN localhost:8000/v1/chat/completions -H "Authorization: Bearer sk_sy_acme_b6525e6c60405226fc726bdda422dd2f" -H 'Content-Type: application/json' -d '{"model":"fast","messages":[{"role":"user","content":"hello"}],"stream":true}'
+curl -sN localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk_sy_acme_b6525e6c60405226fc726bdda422dd2f" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"fast","messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
 
-`GET /v1/scheduler/stats` shows live capacity, per-tenant queue depth, budget
-position, and current output-length predictions. `GET /v1/providers` shows
-breaker state and error breakdown. Mint keys with
-`python -m switchyard.core.auth <tenant-id>`.
+The keys in `switchyard.toml` are development keys, committed so a fresh
+checkout works immediately. They are minted against a built-in development
+pepper and are worthless anywhere that sets `SWITCHYARD_KEY_PEPPER`. Mint real
+ones with `switchyard keys mint <tenant>`.
 
-Or the full stack with dashboards:
+Watch it live, from another terminal:
 
 ```bash
-make up             # gateway :8000, fleet :8100, prometheus :9090, grafana :3000
+switchyard top --key sk_sy_admin_672e27a104b9ede9182f129f4b288395
 ```
+
+```
+switchyard http://127.0.0.1:8000   policy drr   capacity ########.... 16/24   queued 20
+
+  TENANT         WEIGHT  FLOOR  INFLIGHT  QUEUED    TOKENS            BUDGET
+  acme              3.0      6        16      20      34.2K  1.9M / 2.0M left
+  globex            1.0      4         0       0       8.1K  492K / 500K left
+
+  PROVIDER      STATE             OK  FAILED     TTFT   NOTE
+  fast          closed          1204      16    231ms
+  slow          open              88     104        -   retries in 3.2s
+```
+
+---
+
+## Break it on purpose
+
+### A tenant floods the gateway
+
+```bash
+make scenario noisy-neighbour
+```
+
+One tenant runs alone to establish its normal, then a neighbour starts sending
+twenty-five times more. The protected tenant's numbers barely move.
+
+```
+    8.1s  >> noisy tenant starts flooding at 25 req/s (25x the quiet tenant)
+   15.1s     capacity 11/12   quiet:  5 running   0 queued   noisy:  6 running  64 queued
+
+  What happened to the quiet tenant
+    slots it needed         2.4   (1 req/s x 2.4s per request), floor is 6
+    before the flood       0.75 req/s served   queue wait p95      0ms
+    during the flood       0.94 req/s served   queue wait p95      0ms
+    the noisy tenant        479 tokens/s served   401 rejected
+
+    PASS  quiet tenant kept being served                  0.94 of 1 req/s offered
+    PASS  quiet tenant was not made to wait               queue wait p95 0ms
+    PASS  the flood was charged to the tenant causing it  401 noisy rejected, 0 quiet rejected
+```
+
+The floor is what bounds latency, and it has to be sized: a tenant needs
+`offered rate x seconds per request` slots, and anything beyond that comes from
+contended capacity where the neighbour's flood shows up in its latency. The
+scenario prints that arithmetic so the sizing can be checked rather than assumed.
+
+Run it with `--policy fifo` to see the same workload without fair scheduling.
+
+### A provider dies mid-traffic
+
+```bash
+make scenario provider-outage
+```
+
+```
+    8.0s  >> 'fast' starts returning 5xx for every request
+   12.1s  >> circuit breaker for 'fast': closed -> open  (retries in 4s)
+   26.0s  >> 'fast' recovers
+
+  What the client experienced
+    during the outage     72/72 served (100%)
+    after recovery        42/43 served (98%)
+    gateway response      10 transparent failovers, 40 requests skipped a
+                          provider it knew was down
+
+    PASS  clients kept getting answers during the outage  100% served
+    PASS  stopped calling the failing provider            40 requests skipped 'fast'
+    PASS  service recovered after the provider did        98% served after recovery
+```
+
+**Failover is phased on what has already been delivered.** Before the first
+token, another provider serves the request and the client never knows. After it,
+Switchyard will not switch — splicing a second continuation onto a partial
+answer would return corrupted output under a success status. Instead the stream
+ends with a typed error carrying exactly how many tokens arrived.
+
+---
+
+## Does *your* configuration hold?
+
+```bash
+switchyard check     # instant: is it valid, and what does it mean?
+switchyard verify    # ~35s: does it behave that way under load?
+```
+
+`check` is static and starts nothing:
+
+```
+    PASS  capacity is fully allocatable        12 reserved of 24, 12 shared
+    PASS  tenants are isolated from each other 3 of 3 tenants have a reserved floor
+    PASS  operational endpoints are protected  admin key configured
+
+  What this configuration means
+    capacity          24 concurrent requests: 12 reserved as floors, 12 shared
+    tenant 'acme'     floor 6, ceiling 18, 60% of contended capacity
+    model 'slow'      only slow
+                      no fallback: a failure here reaches the client
+    circuit breaker   opens after about 25 failures within the last 50
+```
+
+`verify` runs your configuration — every limit, weight, floor, budget and route
+— against the synthetic fleet, then reports what it measured:
+
+```
+    tenant 'acme'     floor 6, ceiling 18, 60% of contended capacity
+                      -- its floor alone sustains about 3.4 req/s
+                      at the 1.8s per request measured here
+      budget          2,000,000 tokens is about 15,625 more requests
+
+    PASS  a reserved floor protects its tenant     'acme' held 2.38 of 2.36 req/s
+    PASS  traffic survives a provider failure      100% served, 25 failovers
+    PASS  shutdown finishes running work           2 in flight finished in 0.8s
+```
+
+It never calls your real providers, and exits non-zero on failure so it can gate
+a deploy. A guarantee your configuration does not claim is reported as `SKIP`
+with what to add, not silently passed.
+
+---
+
+## Architecture
+
+Single process, single replica. Everything the scheduler needs is correct in
+memory.
+
+```
+                 ┌──────────────────────────────────────────────┐
+   client ──────▶│  GATEWAY                                     │
+   (OpenAI-      │                                              │
+    compatible)  │   auth ──▶ validate ──▶ estimate cost        │
+                 │                              │               │
+                 │                              ▼               │
+                 │   ┌──────────────────────────────────────┐   │
+                 │   │ ADMISSION + SCHEDULER                │   │
+                 │   │  reserved floors │ shared pool       │   │
+                 │   │  bounded queues  │ deadlines         │   │
+                 │   │  weighted fair queueing, in tokens   │   │
+                 │   └──────────────┬───────────────────────┘   │
+                 │                  │ capacity lease            │
+                 │                  ▼                           │
+                 │   ┌──────────────────────────────────────┐   │
+                 │   │ BUDGET LEDGER                        │   │
+                 │   │  reserve ceiling │ clamp │ settle    │   │
+                 │   └──────────────┬───────────────────────┘   │
+                 │                  ▼                           │
+                 │   ┌──────────────────────────────────────┐   │
+                 │   │ PROVIDER ROUTER                      │   │
+                 │   │  candidates │ phased failover        │   │
+                 │   │  circuit breakers │ health           │   │
+                 │   └──────────────┬───────────────────────┘   │
+                 │                  ▼                           │
+                 │   stream pump ──▶ SSE ──▶ settle ──▶ client  │
+                 └──────────────────┬───────────────────────────┘
+                                    ▼
+                 ┌──────────────────────────────────────────────┐
+                 │ PROVIDERS                                    │
+                 │  synthetic fleet (built in, no API key)      │
+                 │  + your own adapters                         │
+                 └──────────────────────────────────────────────┘
+
+   observability          instruments
+   ─────────────          ───────────
+   /metrics  Prometheus   scenarios    break it on purpose
+   /v1/providers  health  verify       check your own config
+   structured logs        top          live operational view
+```
+
+A capacity lease is an async context manager, so completion, provider failure,
+client disconnect and unexpected exceptions all release through one path. A
+failover reuses the same lease and the same budget reservation — a retry is
+still one request competing for capacity.
+
+## Observability
+
+`/metrics` exposes per-tenant queue wait, queue depth, token throughput, budget
+headroom, breaker state, failovers, terminal failures split by whether tokens
+had already been delivered, and event-loop lag. The Grafana dashboard has eleven
+panels covering traffic, scheduling, tenants and providers.
+
+Logs are structured, `text` by default and `json` via `SWITCHYARD_LOG_FORMAT`.
+Notable events log at INFO; one line per request at DEBUG. **Prompts, responses
+and credentials are never logged** — the logging helper rejects those field
+names outright.
+
+```bash
+make up   # gateway :8000, fleet :8100, prometheus :9090, grafana :3000
+```
+
+## Deployment
+
+One process plus the synthetic fleet, or one process pointed at real providers.
+Docker Compose is the supported path and is verified end to end: build, health,
+authenticated scrape, provisioned dashboard.
+
+`switchyard.toml` is mounted rather than baked into the image, so limits can
+change without a rebuild. For anything real, set `SWITCHYARD_KEY_PEPPER` and
+mint fresh keys — the committed ones become worthless the moment you do.
+
+There is no Kubernetes, no Redis, no message broker. Nothing in the product
+needs them, and a single replica is the honest scope.
+
+## CLI
+
+| | |
+|---|---|
+| `switchyard serve` | run the gateway |
+| `switchyard check` | is my configuration valid, and what does it mean? |
+| `switchyard top` | what is happening right now? |
+| `switchyard scenario <name>` | show me what happens in a specific situation |
+| `switchyard verify` | does my configuration behave as intended? |
+| `switchyard keys mint <id>` | mint a tenant or `--admin` credential |
+
+## What this is not
+
+Not a production system. No HA, no secrets management, no compliance story, no
+multi-region. It is a working gateway with the engineering properties above
+demonstrated and measured, not a hosted service.
 
 ## Layout
 
 ```
 src/switchyard/
-  types.py        normalized request and stream-event types; the adapter contract
-  core/           config, auth, scheduler, queue policies, prediction, budgets
-  adapters/       provider implementations
-  gateway/        HTTP surface and the SSE pump
-  obs/            metrics
-  synthetic/      the provider fleet (an instrument, not part of the gateway)
-  bench/          load generator, statistics, figures, experiments
+  core/        config, auth, scheduler, queue policies, prediction, budgets, health, routing
+  gateway/     HTTP surface and the SSE pump
+  adapters/    provider implementations
+  obs/         metrics and structured logging
+  synthetic/   the provider fleet
+  scenarios/   runnable demonstrations
+  bench/       load generator and experiments
+  verify.py    configuration verification
 ```
 
-The scheduler is in-process and single-replica. Everything it needs — slot
-counts, queues, virtual clocks, budgets — is correct in memory, and distributing
-it would mean atomic counters, lease expiry, and a reaper for slots held by a
-replica that died: real work to solve a problem that does not exist until there
-is a second replica.
+`docs/decisions.md` records why the system is built the way it is, including the
+mistakes found along the way.
+
+## Development
+
+```bash
+make check      # ruff, mypy, tests
+make test-all   # including the slow scenario tests
+make bench      # regenerate every figure in plots/
+```
+
+MIT licensed.

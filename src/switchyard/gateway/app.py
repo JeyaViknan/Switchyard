@@ -20,6 +20,7 @@ answer, not a degraded one.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -45,6 +46,7 @@ from switchyard.core.prediction import OutputLengthPredictor
 from switchyard.core.routing import ProviderRouter, RouteObserver
 from switchyard.core.scheduler import AdmissionRejected, RejectReason, Scheduler
 from switchyard.gateway.stream import collect, to_sse
+from switchyard.obs.logs import ensure_configured, event, get_logger
 from switchyard.obs.metrics import (
     ADMISSION_REJECTED,
     BREAKER_STATE,
@@ -67,6 +69,8 @@ from switchyard.obs.metrics import (
     monitor_event_loop_lag,
 )
 from switchyard.types import CompletionRequest, Message
+
+log = get_logger("gateway")
 
 UNSUPPORTED_FIELDS = (
     "tools", "functions", "tool_choice", "function_call", "logprobs",
@@ -172,17 +176,25 @@ class MetricsRouteObserver(RouteObserver):
         self.failed_over = True
         FAILOVERS.labels(from_provider=frm, to_provider=to).inc()
         PROVIDER_ERRORS.labels(provider=frm, error_class=reason.value).inc()
+        event(log, "provider.failover", request_id=request_id, **{"from": frm},
+              to=to, reason=reason.value)
 
     def on_skipped(self, request_id, provider) -> None:
         PROVIDER_SKIPPED.labels(provider=provider).inc()
+        event(log, "provider.skipped", logging.DEBUG,
+              request_id=request_id, provider=provider, reason="breaker_open")
 
     def on_terminal_failure(self, provider, error_class, mid_stream) -> None:
         self.timeline.provider = provider
         PROVIDER_ERRORS.labels(provider=provider, error_class=error_class.value).inc()
+        phase = "mid_stream" if mid_stream else "pre_first_token"
         TERMINAL_FAILURES.labels(
-            provider=provider, error_class=error_class.value,
-            phase="mid_stream" if mid_stream else "pre_first_token",
+            provider=provider, error_class=error_class.value, phase=phase,
         ).inc()
+        # Mid-stream failures are the ones a client cannot be shielded from, so
+        # they are worth surfacing even when everything else is quiet.
+        event(log, "request.failed", provider=provider,
+              error=error_class.value, phase=phase)
 
     def on_success(self, provider, attempts) -> None:
         self.timeline.provider = provider
@@ -275,6 +287,28 @@ def create_app(
     ledger = BudgetLedger.from_tenants(config.tenants)
     provider_health = HealthRegistry(providers, config.breaker)
 
+    def initialise_series() -> None:
+        """Create zero-valued series for label sets that may never be hit.
+
+        A Prometheus counter has no series until its first increment, so a
+        healthy gateway's rejection panel reads "No data" rather than zero --
+        indistinguishable from a broken scrape. The label space here is small
+        and fully known, so the series can simply be created up front.
+
+        Deliberately not done for terminal failures: that label space is
+        provider x error class x phase, and filling it would trade a cosmetic
+        gap for a lot of permanently-zero series.
+        """
+        for tenant in config.tenants:
+            for reason in RejectReason:
+                ADMISSION_REJECTED.labels(tenant=tenant.id, reason=reason.value)
+            QUEUE_DEPTH.labels(tenant=tenant.id).set(0)
+            TENANT_INFLIGHT.labels(tenant=tenant.id).set(0)
+            TENANT_TOKENS.labels(tenant=tenant.id)
+        for name in providers:
+            BREAKER_STATE.labels(provider=name).set(0)
+            PROVIDER_SKIPPED.labels(provider=name)
+
     def publish_scheduler_gauges() -> None:
         stats = scheduler.stats()
         CAPACITY_UTILISATION.set(stats.inflight / config.max_concurrency)
@@ -294,6 +328,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        ensure_configured()
+        initialise_series()
+        event(log, "gateway.started",
+              max_concurrency=config.max_concurrency,
+              policy=config.scheduling_policy,
+              tenants=len(config.tenants),
+              providers=",".join(providers),
+              auth="required" if auth_required else "open")
         client = build_client(
             max_connections=max(1000, config.max_concurrency * 4), timeouts=config.timeouts
         )
@@ -357,7 +399,10 @@ def create_app(
         # queue. A request that cannot be paid for should not occupy a queue
         # slot that another tenant's request could have used.
         if not ledger.has_headroom(tenant.id):
-            return _budget_error(tenant.id, ledger.remaining(tenant.id), request_id)
+            remaining = ledger.remaining(tenant.id)
+            event(log, "request.rejected", request_id=request_id, tenant=tenant.id,
+                  reason="budget_exhausted", remaining_tokens=remaining)
+            return _budget_error(tenant.id, remaining, request_id)
 
         # p50, not the ceiling: this is the scheduler's unbiased guess at what
         # the request will consume, used only to order the queue, and corrected
@@ -374,6 +419,8 @@ def create_app(
         except AdmissionRejected as exc:
             await stack.aclose()
             publish_scheduler_gauges()
+            event(log, "request.rejected", request_id=request_id, tenant=tenant.id,
+                  reason=exc.reason.value, model=parsed.model)
             return JSONResponse(
                 {"error": {"type": exc.reason.value, "message": exc.message,
                            "request_id": request_id}},
@@ -383,6 +430,8 @@ def create_app(
         except BudgetExceeded as exc:
             await stack.aclose()
             publish_scheduler_gauges()
+            event(log, "request.rejected", request_id=request_id, tenant=tenant.id,
+                  reason="budget_exhausted", remaining_tokens=exc.remaining)
             return _budget_error(tenant.id, exc.remaining, request_id)
 
         # The reservation is held at the request's ceiling, so the ceiling has to
@@ -391,6 +440,9 @@ def create_app(
         if reservation.clamped:
             parsed = replace(parsed, max_tokens=reservation.effective_max_tokens)
             MAX_TOKENS_CLAMPED.labels(tenant=tenant.id).inc()
+            event(log, "budget.clamped", request_id=request_id, tenant=tenant.id,
+                  requested_max_tokens=reservation.requested_max_tokens,
+                  allowed_max_tokens=reservation.effective_max_tokens)
 
         timeline.record_queue_wait(lease.queue_wait_s)
         publish_scheduler_gauges()
@@ -399,6 +451,12 @@ def create_app(
             """Record what the request really used, everywhere it matters."""
             lease.actual_tokens = tokens          # settles the fairness clock
             reservation.actual = tokens           # settles the budget
+            event(log, "request.completed", logging.DEBUG,
+                  request_id=request_id, tenant=tenant.id, model=parsed.model,
+                  provider=timeline.provider, tokens=tokens,
+                  queue_wait_ms=round(lease.queue_wait_s * 1000, 1),
+                  attempts=observer.attempts or 1,
+                  failed_over=observer.failed_over)
             if tokens > 0:
                 predictor.observe(tenant.id, parsed.model, tokens)
                 TENANT_TOKENS.labels(tenant=tenant.id).inc(tokens)

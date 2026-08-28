@@ -121,6 +121,7 @@ async def run(reporter: Reporter, capacity: int = 8, healthy_s: float = 8.0,
         seen: dict[str, str] = {}
         try:
             await stack.start(run_seed=seed)
+            reporter.watch_hint(stack.gateway.base_url, admin_raw)
             reporter.start()
             reporter.section("Running")
 

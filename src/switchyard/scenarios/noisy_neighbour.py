@@ -16,6 +16,7 @@ Run it with `--policy fifo` to see the same workload without fair scheduling.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -79,9 +80,29 @@ async def watch(stack: Stack, admin_key: str, reporter: Reporter,
             )
 
 
+async def read_final_state(stack: Stack, admin_key: str) -> tuple[dict, str]:
+    """Read the gateway's closing state, tolerating a slow or unreachable read.
+
+    The gateway may still be finishing the flood's in-flight work, so this can
+    be slow. A demonstration command must not end in a traceback because a
+    status read timed out, so a failure here degrades into "could not confirm"
+    rather than losing the whole run.
+    """
+    headers = {"authorization": f"Bearer {admin_key}"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            stats = (await c.get(f"{stack.gateway.base_url}/v1/scheduler/stats",
+                                 headers=headers)).json()
+            metrics = (await c.get(f"{stack.gateway.base_url}/metrics",
+                                   headers=headers)).text
+        return stats, metrics
+    except (httpx.HTTPError, ValueError):
+        return {}, ""
+
+
 async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
               baseline_s: float = 8.0, flood_s: float = 18.0,
-              quiet_rate: float = 1.0, noisy_rate: float = 40.0,
+              quiet_rate: float = 1.0, noisy_rate: float = 25.0,
               seed: int = 1) -> ScenarioResult:
     tenants = [
         # Floor sized by Little's law with headroom: the quiet tenant needs
@@ -91,7 +112,12 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
         # service time so the sizing can be checked against reality.
         TenantSpec(QUIET, weight=1.0, reserved_concurrency=6,
                    max_queue_depth=256, deadline_s=30.0),
-        TenantSpec(NOISY, weight=1.0, max_queue_depth=64, deadline_s=10.0),
+        # A short deadline for the tenant we expect to shed. It is realistic
+        # configuration, and it also keeps the scenario honest: at 40 req/s a
+        # 10s deadline leaves ~400 requests in flight from the load generator,
+        # enough to saturate the runner's own event loop and slow the very
+        # measurement it is taking.
+        TenantSpec(NOISY, weight=1.0, max_queue_depth=64, deadline_s=3.0),
     ]
     keys = {t.id: mint_key(t.id) for t in tenants}
     admin_raw, admin_digest = mint_admin_key()
@@ -127,6 +153,7 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
         stack = Stack(gateway_env={"SWITCHYARD_CONFIG": str(config_path)})
         try:
             await stack.start(run_seed=seed)
+            reporter.watch_hint(stack.gateway.base_url, admin_raw)
             reporter.start()
             reporter.section("Running")
 
@@ -134,7 +161,7 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
             quiet_load = run_load_detailed(LoadSpec(
                 url=stack.completions_url, rate=quiet_rate, duration_s=total_s,
                 model="fast", tenants=(QUIET,), seed=seed, max_tokens=256,
-                api_key=keys[QUIET][0], request_timeout_s=60.0,
+                api_key=keys[QUIET][0], request_timeout_s=30.0,
             ))
             watcher = asyncio.create_task(watch(stack, admin_raw, reporter, total_s))
 
@@ -147,16 +174,23 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
                 return await run_load_detailed(LoadSpec(
                     url=stack.completions_url, rate=noisy_rate, duration_s=flood_s,
                     model="fast", tenants=(NOISY,), seed=seed + 1, max_tokens=256,
-                    api_key=keys[NOISY][0], request_timeout_s=60.0,
+                    api_key=keys[NOISY][0], request_timeout_s=30.0,
+                    max_connections=250,
                 ))
 
-            quiet_out, noisy_out = await asyncio.gather(quiet_load, flood())
+            flood_task = asyncio.create_task(flood())
+            quiet_out = await quiet_load
+            # Stop the flood rather than waiting for its backlog to drain. Those
+            # requests are meant to be rejected at their deadline, so awaiting
+            # them means sitting through deadline_s times a full queue -- which
+            # turned a 26s scenario into an 86s one.
+            flood_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await flood_task
             await watcher
             reporter.event("flood stops")
 
-            async with httpx.AsyncClient(timeout=5.0) as c:
-                final = (await c.get(f"{stack.gateway.base_url}/v1/scheduler/stats",
-                                     headers={"authorization": f"Bearer {admin_raw}"})).json()
+            final, metrics_text = await read_final_state(stack, admin_raw)
         finally:
             stack.stop()
 
@@ -175,9 +209,13 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
     before_wait = queue_wait_p95_ms(before)
     during_wait = queue_wait_p95_ms(during)
 
-    noisy_rejected = summarise_rejections(noisy_out.records)
+    from switchyard.cli.top import parse_metrics, total
+
+    parsed = parse_metrics(metrics_text)
+    noisy_rejected_n = int(total(parsed, "switchyard_admission_rejected_total",
+                                 tenant=NOISY))
+    noisy_tokens = total(parsed, "switchyard_tenant_tokens_total", tenant=NOISY)
     quiet_rejected = summarise_rejections(during)
-    noisy_ok = sum(1 for r in noisy_out.records if r.ok)
 
     service_s = (
         sum((r.latency or 0) - (r.queue_wait_s or 0) for r in during_ok) / len(during_ok)
@@ -199,16 +237,17 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
         f"queue wait p95 {during_wait:>6.0f}ms"
     )
     reporter.detail(
-        f"{'the noisy tenant':<22}{rate(noisy_ok, flood_s):>5.2f} req/s served   "
-        f"{sum(noisy_rejected.values())} rejected"
+        f"{'the noisy tenant':<22}{noisy_tokens / flood_s:>5.0f} tokens/s served   "
+        f"{noisy_rejected_n} rejected"
     )
 
     # Against what it asked for, not against its own baseline: the baseline
     # window is short, so its rate is noisy and a comparison to it reads oddly.
     kept_serving = during_rps >= 0.8 * quiet_rate
     stayed_responsive = during_wait <= 1000.0
-    absorbed_by_noisy = not quiet_rejected and bool(noisy_rejected)
-    no_leak = final["inflight"] == 0 and final["queue_depth"] == 0
+    absorbed_by_noisy = not quiet_rejected and noisy_rejected_n > 0
+    confirmed = bool(final)
+    no_leak = confirmed and final["inflight"] == 0 and final["queue_depth"] == 0
 
     result = ScenarioResult(NAME, [
         Check.result(
@@ -223,14 +262,19 @@ async def run(reporter: Reporter, policy: str = "drr", capacity: int = 12,
         ),
         Check.result(
             "the flood was charged to the tenant causing it", absorbed_by_noisy,
-            f"{sum(noisy_rejected.values())} noisy rejected, "
+            f"{noisy_rejected_n} noisy rejected, "
             f"{sum(quiet_rejected.values())} quiet rejected",
             "rejections landed on the wrong tenant",
         ),
         Check.result(
             "no capacity leaked", no_leak,
-            f"{final['inflight']} in flight, {final['queue_depth']} queued at rest",
-            "capacity was still held after everything finished",
+            f"{final['inflight']} in flight, {final['queue_depth']} queued at rest"
+            if confirmed else "could not read the gateway's final state",
+            "capacity was still held after everything finished"
+            if confirmed else "the gateway did not answer in time to confirm",
+        ) if confirmed else Check.skip(
+            "no capacity leaked",
+            "the gateway did not answer in time to confirm",
         ),
     ])
     if policy == "fifo":

@@ -118,6 +118,19 @@ class Reporter:
         for line in rendered:
             self._write(line)
 
+    def watch_hint(self, base_url: str, admin_key: str) -> None:
+        """Show how to watch this scenario's gateway from another terminal.
+
+        A scenario runs its own gateway on an ephemeral port, so the standing
+        `switchyard top` will not find it. Grafana is not required: the CLI view
+        is the intended way to watch a scenario live.
+        """
+        self._write(f"    {self.style.dim('watch it live from another terminal:')}")
+        self._write(
+            f"      switchyard top --url {base_url} --key {admin_key}"
+        )
+        self._write()
+
     def note(self, text: str) -> None:
         self._write(f"    {self.style.dim(text)}")
 

@@ -145,3 +145,25 @@ def test_request_rejected_before_dispatch_is_all_gateway_time():
     timeline.finish("m", "none", "error")   # never dispatched
 
     assert delta("switchyard_provider_time_seconds", before) == 0.0
+
+
+# -- series that must exist before anything happens ------------------------
+
+
+async def test_rejection_series_exist_before_anything_is_rejected(tenant_gateway):
+    """A healthy gateway should read zero, not "No data".
+
+    A Prometheus counter has no series until its first increment, so a
+    dashboard panel for something that has not happened is indistinguishable
+    from a broken scrape.
+    """
+    import httpx
+
+    async with httpx.AsyncClient() as c:
+        text = (await c.get(f"{tenant_gateway.base_url}/metrics",
+                            headers=tenant_gateway.admin())).text
+
+    for reason in ("queue_full", "deadline", "shutting_down"):
+        assert f'switchyard_admission_rejected_total{{reason="{reason}",tenant="alpha"}}' in text
+    assert 'switchyard_breaker_state{provider="quick"} 0.0' in text
+    assert 'switchyard_queue_depth{tenant="alpha"} 0.0' in text

@@ -135,28 +135,3 @@ def bearer_from_header(header: str | None) -> str | None:
     if scheme.lower() == "bearer" and value:
         return value.strip()
     return header.strip() or None
-
-
-def main(argv: list[str] | None = None) -> int:
-    """Mint an API key: `python -m switchyard.core.auth <tenant-id>`."""
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Mint a Switchyard API key")
-    parser.add_argument("tenant_id")
-    args = parser.parse_args(argv)
-
-    raw, digest = mint_key(args.tenant_id)
-    print(f"key    {raw}")
-    print(f"digest {digest}")
-    print("\nAdd to switchyard.toml:\n")
-    print("[[tenants]]")
-    print(f'id = "{args.tenant_id}"')
-    print(f'key_sha256 = "{digest}"')
-    print("\nThe key is shown once. Only the digest is stored.")
-    if PEPPER_ENV not in os.environ:
-        print(f"\nNote: {PEPPER_ENV} is unset, so the development pepper was used.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

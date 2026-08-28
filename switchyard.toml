@@ -5,7 +5,7 @@
 # built-in development pepper and are worthless anywhere that sets
 # SWITCHYARD_KEY_PEPPER. Mint real ones with:
 #
-#     python -m switchyard.core.auth <tenant-id>
+#     switchyard keys mint <tenant-id>
 
 [gateway]
 # Ordered failover candidates. A model with no entry maps to the provider of the

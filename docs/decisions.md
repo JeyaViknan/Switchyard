@@ -416,3 +416,53 @@ lands while the provider is still broken decides how long the breaker stays shut
 afterwards, and the jittered doubling cooldown moves recovery by tens of seconds.
 That is the backoff working as designed rather than measurement noise, so the
 documented result is the stable one.
+
+
+## Week 4 -- deployment and productisation
+
+**The configuration is mounted into the container, not baked into the image.**
+This was found by finally running the stack rather than validating it. The
+Dockerfile copied `src/` and `pyproject.toml` but never the configuration, so
+the gateway container had been crashing on startup for three weeks behind a
+compose file that validated cleanly. Mounting is also the better answer on its
+own terms: configuration carries credentials, and changing a limit should not
+require a rebuild.
+
+The lesson is narrower than "test your deployment": `docker compose config`
+validates syntax and says nothing about whether the thing starts. A healthcheck
+on the gateway service now makes a failure to start visible instead of silent.
+
+**Scenarios stop their flood rather than waiting for it to drain.**
+The noisy-neighbour scenario awaited every flooding request, which meant sitting
+through the tenant's deadline for a full queue -- an intermittent 26-second
+scenario that took 86. Those requests exist to be rejected; waiting for them
+measures the deadline, not the scheduler. The same fix had already been made in
+`verify` and was simply never carried back, which is its own lesson about
+fixing a pattern in one place.
+
+**A demonstration command never ends in a traceback.**
+The same investigation surfaced a scenario crashing with `httpx.ReadTimeout`
+because its closing status read had a five-second timeout while the gateway was
+still finishing work. A failed status read now degrades to "could not confirm"
+and the check is reported as skipped. Whatever else is true, a command whose
+purpose is to show the product working must not fall over while doing it.
+
+**The flooding tenant gets a short deadline.**
+At 25 req/s with a ten-second deadline the load generator holds several hundred
+open connections, and both generators share the scenario runner's event loop --
+enough to slow the very measurement being taken. A three-second deadline is
+realistic configuration for a tenant you expect to shed, and it keeps the
+instrument from contending with itself.
+
+**The demo is a command and a transcript, not a video.**
+`make demo` runs contention, then an outage, then a configuration check. A
+recorded run lives in `docs/demo.md` for people who will not clone the
+repository. No terminal-recording tooling is installed here, and a GIF would
+have meant adding a dependency to produce an artifact the product already
+communicates on its own.
+
+**Deployment is one process, and Compose is the supported path.**
+Verified end to end: build, healthy start, authenticated Prometheus scrape,
+provisioned Grafana dashboard with every panel returning data. Nothing in the
+product needs an orchestrator, and a single replica is the honest scope for a
+scheduler whose state is correct in memory.

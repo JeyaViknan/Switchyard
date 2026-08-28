@@ -5,7 +5,7 @@ PY     := $(VENV)/bin/python
 PYTHON ?= python3
 
 .PHONY: install test lint typecheck test-all check bench bench-baseline bench-fairness bench-faults \
-        scenario noisy-neighbour provider-outage verify dev up down clean
+        scenario noisy-neighbour provider-outage verify demo dev up down clean
 
 install:
 	@$(PYTHON) -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' \
@@ -50,6 +50,13 @@ scenario:
 
 noisy-neighbour provider-outage:
 	@:
+
+# The whole story in one command: contention, then an outage, then a check of
+# the configuration that survived both. About three minutes, no API key.
+demo:
+	@$(PY) -m switchyard.cli.main scenario noisy-neighbour
+	@$(PY) -m switchyard.cli.main scenario provider-outage
+	@$(PY) -m switchyard.cli.main verify
 
 # Check that the guarantees in switchyard.toml actually hold.
 verify:

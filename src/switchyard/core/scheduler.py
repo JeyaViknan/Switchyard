@@ -46,6 +46,9 @@ from dataclasses import dataclass, field
 
 from switchyard.core.config import GatewayConfig, Tenant
 from switchyard.core.queueing import QueuePolicy, Waiter, build_policy
+from switchyard.obs.logs import event, get_logger
+
+log = get_logger("scheduler")
 
 
 class RejectReason(enum.StrEnum):
@@ -304,7 +307,15 @@ class Scheduler:
         are abandoned and reported rather than silently waited on.
         """
         started = self._clock()
+        # Draining twice is harmless -- an explicit /v1/admin/drain is normally
+        # followed by the lifespan's own drain at shutdown -- but logging it
+        # twice suggests two separate events happened.
+        first_call = not self._closed
         self._closed = True
+        if first_call:
+            event(log, "drain.started",
+                  inflight=sum(self._tenant_inflight.values()),
+                  queued=self._policy.depth(), timeout_s=timeout_s)
 
         queued = 0
         for seq, future in list(self._waiting.items()):
@@ -320,12 +331,18 @@ class Scheduler:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._idle.wait(), timeout=timeout_s)
 
-        return DrainResult(
+        result = DrainResult(
             queued_rejected=queued,
             inflight_at_start=inflight_at_start,
             inflight_remaining=sum(self._tenant_inflight.values()),
             waited_s=self._clock() - started,
         )
+        if first_call:
+            event(log, "drain.finished", clean=result.clean,
+                  queued_rejected=result.queued_rejected,
+                  inflight_remaining=result.inflight_remaining,
+                  waited_s=round(result.waited_s, 2))
+        return result
 
     async def close(self) -> None:
         """Immediate stop: refuse queued work, do not wait for anything running."""

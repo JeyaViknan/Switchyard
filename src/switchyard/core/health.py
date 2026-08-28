@@ -36,7 +36,10 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from switchyard.obs.logs import event, get_logger
 from switchyard.types import ErrorClass
+
+log = get_logger("health")
 
 
 class BreakerState(enum.StrEnum):
@@ -98,6 +101,8 @@ class ProviderHealth:
         if self._state is BreakerState.OPEN and self.clock() >= self._reopen_at:
             self._state = BreakerState.HALF_OPEN
             self._probes_in_flight = 0
+            event(log, "breaker.half_open", provider=self.name,
+                  probes=self.policy.half_open_probes)
         return self._state
 
     def allow(self) -> bool:
@@ -165,6 +170,7 @@ class ProviderHealth:
         return failures / len(self._outcomes) >= self.policy.failure_threshold
 
     def _open(self) -> None:
+        was = self._state
         self._state = BreakerState.OPEN
         self._consecutive_trips += 1
         # Exponential backoff on repeated trips, jittered so that everything
@@ -176,11 +182,19 @@ class ProviderHealth:
         spread = base * self.policy.jitter
         self._reopen_at = self.clock() + base + (self.jitter_source() * 2 - 1) * spread
         self._outcomes.clear()
+        event(log, "breaker.opened", provider=self.name, was=was.value,
+              trips=self._consecutive_trips,
+              retry_in_s=round(self._reopen_at - self.clock(), 1),
+              failures=self._failures)
 
     def _close(self) -> None:
+        was = self._state
         self._state = BreakerState.CLOSED
         self._consecutive_trips = 0
         self._outcomes.clear()
+        if was is not BreakerState.CLOSED:
+            event(log, "breaker.closed", provider=self.name, was=was.value,
+                  successes=self._successes)
 
     def snapshot(self) -> dict[str, object]:
         return {

@@ -7,6 +7,8 @@ name = "switchyard"
 version = "0.1.0"
 description = "Admission control and fair scheduling for LLM inference capacity under output-length uncertainty"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
 
 dependencies = [
     "fastapi",
