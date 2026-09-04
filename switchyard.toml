@@ -28,6 +28,24 @@ admin_key_sha256 = "a9f76f1a903a4dc58af571e1fc2294e3de0f1e033de4469bafb0962fbd85
 fast = ["fast", "slow"]     # if "fast" is failing, fall back to "slow"
 slow = ["slow"]
 
+# Providers with no [providers.<name>] section resolve to the built-in synthetic
+# fleet, which is why this file needs no credentials. To use a real one, add its
+# endpoint and list it in gateway.providers -- any OpenAI-compatible API works
+# (OpenAI, Together, Groq, OpenRouter, a local Ollama or vLLM):
+#
+#   [providers.openai]
+#   base_url = "https://api.openai.com/v1"
+#   api_key_env = "OPENAI_API_KEY"   # read from the environment, never stored here
+#   upstream_model = "gpt-4o-mini"   # optional: what to ask upstream for
+#
+#   [providers.local]
+#   base_url = "http://localhost:11434/v1"   # Ollama
+#
+# Then route to it, with the synthetic fleet as a fallback or vice versa:
+#
+#   [routes]
+#   fast = ["openai", "local"]
+
 # Four deadlines rather than one, so "slow" is not a single failure mode.
 # ttft_s is the important one: a failure before the first token can be retried on
 # another provider invisibly, so keeping this tight pushes failure mass into the

@@ -269,6 +269,32 @@ names outright.
 make up   # gateway :8000, fleet :8100, prometheus :9090, grafana :3000
 ```
 
+## Using a real provider
+
+Everything above runs on the built-in synthetic fleet, which is why it needs no
+API key. Switchyard speaks one upstream format — OpenAI chat completions — so
+pointing it at a real provider is configuration, not code:
+
+```toml
+[gateway]
+providers = ["openai", "local"]
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"       # read from the environment, never stored
+upstream_model = "gpt-4o-mini"
+
+[providers.local]
+base_url = "http://localhost:11434/v1"   # Ollama, vLLM, anything compatible
+
+[routes]
+fast = ["openai", "local"]           # fall back to local when OpenAI is down
+```
+
+The demo path and the production path run the same adapter — the synthetic fleet
+is an OpenAI-compatible endpoint like any other, not a special case. Scheduling,
+budgets, breakers and failover behave identically either way.
+
 ## Deployment
 
 One process plus the synthetic fleet, or one process pointed at real providers.

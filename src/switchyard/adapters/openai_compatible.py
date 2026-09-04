@@ -1,4 +1,9 @@
-"""Adapter for the synthetic provider fleet.
+"""Adapter for any OpenAI-compatible chat-completions endpoint.
+
+That covers OpenAI itself, Together, Groq, OpenRouter, a local Ollama or vLLM,
+and the built-in synthetic fleet -- which is deliberately the same wire format,
+so the demo path and the production path run identical code rather than the
+demo exercising a special case.
 
 Adapters translate a provider's wire format into the normalized `StreamEvent`
 union. The contract they must honour: never raise for a provider-side failure,
@@ -38,7 +43,7 @@ from collections.abc import AsyncIterator
 import httpx
 import orjson
 
-from switchyard.core.config import TimeoutPolicy
+from switchyard.core.config import ProviderConfig, TimeoutPolicy
 from switchyard.types import (
     CompletionRequest,
     ErrorClass,
@@ -79,27 +84,41 @@ def classify_status(status: int) -> ErrorClass:
     return ErrorClass.BAD_REQUEST
 
 
-class SyntheticAdapter:
-    """Speaks to one named provider in the synthetic fleet."""
+class OpenAICompatibleAdapter:
+    """Speaks to one provider over the OpenAI chat-completions API."""
 
     def __init__(
-        self, name: str, base_url: str, client: httpx.AsyncClient,
+        self, endpoint: ProviderConfig, client: httpx.AsyncClient,
         timeouts: TimeoutPolicy | None = None,
     ) -> None:
-        self.name = name
-        self._url = f"{base_url.rstrip('/')}/v1/{name}/chat/completions"
+        self.name = endpoint.name
+        self._endpoint = endpoint
+        self._url = f"{endpoint.base_url.rstrip('/')}/chat/completions"
         self._client = client
         self._timeouts = timeouts or TimeoutPolicy()
 
+    @classmethod
+    def synthetic(cls, name: str, fleet_url: str, client: httpx.AsyncClient,
+                  timeouts: TimeoutPolicy | None = None) -> OpenAICompatibleAdapter:
+        """Point at the built-in fleet. Convenience for tests and scenarios."""
+        return cls(
+            ProviderConfig(name=name, base_url=f"{fleet_url.rstrip('/')}/v1/{name}"),
+            client, timeouts,
+        )
+
     async def stream(self, request: CompletionRequest) -> AsyncIterator[StreamEvent]:
         body = {
-            "model": request.model,
+            # The upstream may know the model by a different name than tenants
+            # do, which lets a tenant-facing name outlive the model behind it.
+            "model": self._endpoint.upstream_model or request.model,
             "messages": [{"role": m.role, "content": m.content} for m in request.messages],
             "stream": True,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
         }
         headers = {REQUEST_ID_HEADER: request.request_id}
+        if key := self._endpoint.api_key():
+            headers["authorization"] = f"Bearer {key}"
 
         emitted = 0
         prompt_tokens = 0

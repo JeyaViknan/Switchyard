@@ -14,6 +14,7 @@ numbers would be stale the week after they were written.
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,6 +108,45 @@ class TimeoutPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderConfig:
+    """Where a provider lives and how to authenticate to it.
+
+    Any OpenAI-compatible endpoint works, because that is the only wire format
+    Switchyard speaks upstream: OpenAI itself, Together, Groq, OpenRouter, a
+    local Ollama or vLLM, or the built-in synthetic fleet. `base_url` is the
+    part before `/chat/completions`.
+
+    The API key is named, never inlined -- a configuration file that carries a
+    provider credential is a configuration file you cannot commit.
+    """
+
+    name: str
+    base_url: str
+    api_key_env: str | None = None
+    # What to ask the upstream for, when it differs from the model name tenants
+    # use. Lets a tenant-facing name stay stable while the model behind it moves.
+    upstream_model: str | None = None
+
+    def validate(self) -> None:
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ConfigError(
+                f"providers.{self.name}.base_url must be an http(s) URL, "
+                f"got {self.base_url!r}"
+            )
+
+    def api_key(self) -> str | None:
+        return os.environ.get(self.api_key_env) if self.api_key_env else None
+
+    @property
+    def needs_key(self) -> bool:
+        return self.api_key_env is not None
+
+    @property
+    def key_available(self) -> bool:
+        return not self.needs_key or bool(self.api_key())
+
+
+@dataclass(frozen=True, slots=True)
 class BreakerConfig:
     """Circuit-breaker tuning, mirrored from core.health.BreakerPolicy."""
 
@@ -146,6 +186,9 @@ class GatewayConfig:
     # Ordered failover candidates per model. A model with no entry maps to the
     # provider of the same name, so single-provider setups need no routes at all.
     routes: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # Explicit endpoints for named providers. Anything not listed here defaults
+    # to the built-in synthetic fleet, so a fresh checkout needs no credentials.
+    provider_endpoints: dict[str, ProviderConfig] = field(default_factory=dict)
 
     def validate(self) -> None:
         if self.max_concurrency < 1:
@@ -158,6 +201,14 @@ class GatewayConfig:
         from switchyard.core.health import BreakerPolicy
 
         BreakerPolicy(**{f: getattr(self.breaker, f) for f in BreakerConfig.__slots__}).validate()
+        for endpoint in self.provider_endpoints.values():
+            endpoint.validate()
+        unknown_endpoints = set(self.provider_endpoints) - set(self.providers)
+        if unknown_endpoints:
+            raise ConfigError(
+                f"[providers] configures {sorted(unknown_endpoints)}, which are not "
+                f"in gateway.providers {list(self.providers)}"
+            )
         for model, candidates in self.routes.items():
             if not candidates:
                 raise ConfigError(f"routes.{model} lists no providers")
@@ -194,6 +245,24 @@ class GatewayConfig:
     @property
     def tenants_by_id(self) -> dict[str, Tenant]:
         return {t.id: t for t in self.tenants}
+
+    def endpoint_for(self, provider: str) -> ProviderConfig:
+        """Where to send traffic for a provider.
+
+        Unconfigured providers resolve to the synthetic fleet, which is what
+        makes the demo work with no credentials and no spend.
+        """
+        configured = self.provider_endpoints.get(provider)
+        if configured is not None:
+            return configured
+        return ProviderConfig(
+            name=provider, base_url=f"{self.fleet_url.rstrip('/')}/v1/{provider}"
+        )
+
+    @property
+    def real_providers(self) -> tuple[str, ...]:
+        """Providers pointed at something other than the synthetic fleet."""
+        return tuple(sorted(self.provider_endpoints))
 
 
 def _tenant_from_toml(raw: dict[str, Any]) -> Tenant:
@@ -243,6 +312,16 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> GatewayConfig:
         raise ConfigError(f"[breaker]: unknown field(s) {sorted(unknown)}")
     if breaker_raw:
         gateway_raw["breaker"] = BreakerConfig(**breaker_raw)
+
+    providers_raw = raw.get("providers", {})
+    if providers_raw:
+        endpoints = {}
+        for name, entry in providers_raw.items():
+            unknown = set(entry) - {"base_url", "api_key_env", "upstream_model"}
+            if unknown:
+                raise ConfigError(f"providers.{name}: unknown field(s) {sorted(unknown)}")
+            endpoints[name] = ProviderConfig(name=name, **entry)
+        gateway_raw["provider_endpoints"] = endpoints
 
     routes_raw = raw.get("routes", {})
     if routes_raw:

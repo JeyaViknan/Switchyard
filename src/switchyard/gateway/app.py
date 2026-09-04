@@ -31,7 +31,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from switchyard.adapters.synthetic import SyntheticAdapter, build_client
+from switchyard.adapters.openai_compatible import (
+    OpenAICompatibleAdapter,
+    build_client,
+)
 from switchyard.core.auth import (
     AdminAuthError,
     AuthError,
@@ -265,8 +268,15 @@ def create_app(
 ) -> FastAPI:
     if config is None:
         config = load_config(os.environ.get("SWITCHYARD_CONFIG", DEFAULT_CONFIG_PATH))
+    # Fold the resolved fleet URL back into the config, so that
+    # `config.endpoint_for()` -- which is what actually builds each adapter --
+    # sees the same value as an explicit argument or the environment.
     fleet_url = fleet_url or os.environ.get("SWITCHYARD_FLEET_URL") or config.fleet_url
+    if fleet_url != config.fleet_url:
+        config = replace(config, fleet_url=fleet_url)
     providers = providers or config.providers
+    if providers != config.providers:
+        config = replace(config, providers=tuple(providers))
 
     registry = TenantRegistry.from_config(config)
     auth_required = bool(config.tenants)
@@ -345,7 +355,9 @@ def create_app(
         app.state.predictor = predictor
         app.state.ledger = ledger
         adapters = {
-            name: SyntheticAdapter(name, fleet_url, client, config.timeouts)
+            name: OpenAICompatibleAdapter(
+                config.endpoint_for(name), client, config.timeouts
+            )
             for name in providers
         }
         app.state.adapters = adapters

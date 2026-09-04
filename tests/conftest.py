@@ -132,7 +132,8 @@ def build_tenant_config(max_concurrency: int = 4, policy: str = "drr", **tenant_
 
 
 @asynccontextmanager
-async def serve_gateway(config, fleet: RunningServer, keys: dict[str, str] | None = None):
+async def serve_gateway(config, fleet: RunningServer, keys: dict[str, str] | None = None,
+                        providers: tuple[str, ...] | None = None):
     """Run a gateway from an explicit config, over a real socket.
 
     Used by tests that need capacity or queue limits the shared fixture does not
@@ -141,8 +142,11 @@ async def serve_gateway(config, fleet: RunningServer, keys: dict[str, str] | Non
     """
     from switchyard.gateway.app import create_app as create_gateway
 
+    # Defaults to the fleet fixture's providers; a config naming its own
+    # (a real endpoint, say) passes them through instead.
     server, task, port = await _serve(
-        create_gateway(config=config, fleet_url=fleet.base_url, providers=("quick", "held"))
+        create_gateway(config=config, fleet_url=fleet.base_url,
+                       providers=providers or ("quick", "held"))
     )
     try:
         yield TenantGateway(f"http://127.0.0.1:{port}", fleet, keys or {}, config)

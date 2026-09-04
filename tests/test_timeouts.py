@@ -14,7 +14,10 @@ import time
 
 import pytest
 
-from switchyard.adapters.synthetic import SyntheticAdapter, build_client
+from switchyard.adapters.openai_compatible import (
+    OpenAICompatibleAdapter,
+    build_client,
+)
 from switchyard.core.config import TimeoutPolicy
 from switchyard.synthetic.profiles import FaultSpec, ProviderProfile
 from switchyard.types import CompletionRequest, ErrorClass, Message, StreamDone, StreamFailed
@@ -38,7 +41,9 @@ async def collect(fleet_server, timeouts: TimeoutPolicy, consume_delay: float = 
     """Run one request through the adapter, returning every event."""
     client = build_client(timeouts=timeouts)
     try:
-        adapter = SyntheticAdapter("quick", fleet_server.base_url, client, timeouts)
+        adapter = OpenAICompatibleAdapter.synthetic(
+            "quick", fleet_server.base_url, client, timeouts
+        )
         events = []
         async for event in adapter.stream(REQUEST):
             events.append(event)
@@ -108,7 +113,9 @@ async def test_an_unreachable_provider_gives_connect(fleet_server):
     client = build_client(timeouts=timeouts)
     try:
         # Port 1 is reserved and nothing listens on it.
-        adapter = SyntheticAdapter("quick", "http://127.0.0.1:1", client, timeouts)
+        adapter = OpenAICompatibleAdapter.synthetic(
+            "quick", "http://127.0.0.1:1", client, timeouts
+        )
         events = [e async for e in adapter.stream(REQUEST)]
     finally:
         await client.aclose()
