@@ -117,10 +117,37 @@ class BudgetLedger:
     """
 
     budgets: dict[str, TenantBudget] = field(default_factory=dict)
+    # Set whenever `spent` moves, cleared when a store has written it out. Lets
+    # the periodic flush skip the write on an idle gateway instead of rewriting
+    # an identical file every couple of seconds.
+    dirty: bool = False
 
     @classmethod
     def from_tenants(cls, tenants: tuple[Tenant, ...]) -> BudgetLedger:
         return cls({t.id: TenantBudget(limit=t.budget_tokens) for t in tenants})
+
+    def restore(self, spent: dict[str, int]) -> dict[str, int]:
+        """Adopt spend totals recorded by a previous run.
+
+        Called once at startup, before anything is served. Entries for tenants
+        that are no longer configured are ignored rather than dropped: the
+        caller keeps the original mapping so that removing a tenant from the
+        config for a day does not quietly refund its budget.
+
+        Returns what was actually applied, so startup can report it.
+        """
+        applied: dict[str, int] = {}
+        for tenant_id, total in spent.items():
+            budget = self.budgets.get(tenant_id)
+            if budget is None:
+                continue
+            budget.spent = total
+            applied[tenant_id] = total
+        return applied
+
+    def spent_totals(self) -> dict[str, int]:
+        """What each tenant has consumed, for persistence."""
+        return {tid: b.spent for tid, b in self.budgets.items()}
 
     def _budget(self, tenant_id: str) -> TenantBudget:
         budget = self.budgets.get(tenant_id)
@@ -183,6 +210,8 @@ class BudgetLedger:
         # ceiling: exceeding it would mean the clamp was not applied.
         actual = min(reservation.actual or 0, reservation.reserved)
         budget.spent += actual
+        if actual:
+            self.dirty = True
 
     def snapshot(self) -> dict[str, dict[str, int | None]]:
         return {

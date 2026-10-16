@@ -45,6 +45,7 @@ from switchyard.core.auth import (
 from switchyard.core.budget import BudgetExceeded, BudgetLedger
 from switchyard.core.config import DEFAULT_CONFIG_PATH, GatewayConfig, Tenant, load_config
 from switchyard.core.health import BreakerState, HealthRegistry
+from switchyard.core.persistence import StateError, store_for
 from switchyard.core.prediction import OutputLengthPredictor
 from switchyard.core.routing import ProviderRouter, RouteObserver
 from switchyard.core.scheduler import AdmissionRejected, RejectReason, Scheduler
@@ -277,6 +278,13 @@ def create_app(
     providers = providers or config.providers
     if providers != config.providers:
         config = replace(config, providers=tuple(providers))
+    # Where spend is kept is a deployment concern, not a configuration one: the
+    # same switchyard.toml is mounted read-only into a container that has a
+    # volume for it and run from a checkout that does not.
+    state_file = os.environ.get("SWITCHYARD_STATE_FILE") or config.state_file
+    if state_file != config.state_file:
+        config = replace(config, state_file=state_file)
+        config.validate()
 
     registry = TenantRegistry.from_config(config)
     auth_required = bool(config.tenants)
@@ -295,6 +303,36 @@ def create_app(
 
     scheduler = Scheduler(config, on_dispatch=on_dispatch, on_reject=on_reject)
     ledger = BudgetLedger.from_tenants(config.tenants)
+    budget_store = store_for(config.state_file)
+    # Loaded here rather than in the lifespan so that a corrupt state file
+    # fails the factory -- before the port is bound and before a client can be
+    # told the gateway is healthy while serving everyone a fresh budget.
+    recovered_spend = budget_store.load()
+    restored = ledger.restore(recovered_spend)
+
+    def persist_spend() -> None:
+        """Write spend out, merging over totals from tenants not configured now.
+
+        A tenant dropped from the config keeps its recorded spend in the file,
+        so re-adding it later resumes where it left off rather than granting a
+        silent refund.
+        """
+        if not ledger.dirty:
+            return
+        merged = {**recovered_spend, **ledger.spent_totals()}
+        budget_store.save(merged)
+        ledger.dirty = False
+
+    async def flush_spend_periodically(interval: float) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                persist_spend()
+            except StateError as exc:
+                # A failing disk must not take the gateway down: budgets are
+                # still enforced in memory, and the next flush may succeed.
+                # Loud, because recovery after a restart is now degraded.
+                event(log, "budget.persist_failed", level=logging.ERROR, error=str(exc))
     provider_health = HealthRegistry(providers, config.breaker)
 
     def initialise_series() -> None:
@@ -345,7 +383,10 @@ def create_app(
               policy=config.scheduling_policy,
               tenants=len(config.tenants),
               providers=",".join(providers),
-              auth="required" if auth_required else "open")
+              auth="required" if auth_required else "open",
+              state="ephemeral" if config.state_file is None else config.state_file,
+              restored_tenants=len(restored),
+              restored_tokens=sum(restored.values()))
         client = build_client(
             max_connections=max(1000, config.max_concurrency * 4), timeouts=config.timeouts
         )
@@ -364,13 +405,26 @@ def create_app(
         app.state.router = ProviderRouter(adapters, config.routes, provider_health)
         app.state.provider_health = provider_health
         lag_task = asyncio.create_task(monitor_event_loop_lag())
+        flush_task = (
+            asyncio.create_task(flush_spend_periodically(config.state_flush_interval_s))
+            if config.state_file is not None
+            else None
+        )
         try:
             yield
         finally:
             lag_task.cancel()
+            if flush_task is not None:
+                flush_task.cancel()
             # Refuse queued work immediately, let running streams finish.
             result = await scheduler.drain(config.drain_timeout_s)
             app.state.drain_result = result
+            # After drain, so the spend of requests that finished during
+            # shutdown is included rather than lost in the last window.
+            try:
+                persist_spend()
+            except StateError as exc:
+                event(log, "budget.persist_failed", level=logging.ERROR, error=str(exc))
             await client.aclose()
 
     app = FastAPI(title="Switchyard", lifespan=lifespan)

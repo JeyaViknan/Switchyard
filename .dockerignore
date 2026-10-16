@@ -1,0 +1,19 @@
+# Build inputs are pyproject.toml, README.md, LICENSE and src/. Everything else
+# only invalidates the layer cache.
+.venv/
+.git/
+.github/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+tests/
+docs/
+deploy/
+plots/
+results/
+*.parquet
+*.svg
+docker-compose.yml
+Makefile

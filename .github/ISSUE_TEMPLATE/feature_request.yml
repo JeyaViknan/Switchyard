@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a change
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today?
+    validations: {required: true}
+  - type: textarea
+    id: evidence
+    attributes:
+      label: What would show it works
+      description: >
+        Switchyard tries to keep every component tied to an invariant it
+        enforces or a number it produces. Which would this be? A new check in
+        `switchyard verify`, a scenario, a benchmark, or a test.
+    validations: {required: true}
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

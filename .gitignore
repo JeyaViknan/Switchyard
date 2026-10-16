@@ -17,3 +17,7 @@ results/
 
 # OS
 .DS_Store
+
+# Tenant spend, written at runtime.
+switchyard-state.json
+*.state.json

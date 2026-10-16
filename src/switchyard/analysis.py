@@ -120,6 +120,29 @@ def review(config: GatewayConfig) -> list[Check]:
         "metrics, scheduler stats and drain would be unreachable",
         "run `switchyard keys mint --admin` and set gateway.admin_key_sha256",
     ))
+
+    # A budget enforced only for the lifetime of one process is not a budget.
+    # Reported as a SKIP rather than a failure because running without it is a
+    # legitimate choice for a demo -- but a silent one is not.
+    budgeted = [t.id for t in config.tenants if t.budget_tokens is not None]
+    if not budgeted:
+        checks.append(Check.skip(
+            "budgets survive a restart",
+            "no tenant sets budget_tokens, so there is no spend to keep",
+        ))
+    elif config.state_file is None:
+        checks.append(Check.skip(
+            "budgets survive a restart",
+            f"no gateway.state_file set: {len(budgeted)} budgeted tenant(s) start "
+            f"again from zero spend every time the gateway restarts",
+            "set gateway.state_file to a writable path to keep spend across restarts",
+        ))
+    else:
+        checks.append(Check.result(
+            "budgets survive a restart", True,
+            f"spend for {len(budgeted)} tenant(s) is kept in {config.state_file}, "
+            f"flushed every {config.state_flush_interval_s:g}s",
+        ))
     return checks
 
 

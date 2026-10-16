@@ -183,6 +183,12 @@ class GatewayConfig:
     breaker: BreakerConfig = BreakerConfig()
     # How long shutdown waits for in-flight requests before abandoning them.
     drain_timeout_s: float = 30.0
+    # Where tenant spend is kept between runs. Unset means budgets reset on
+    # restart, which is right for a demo and wrong for a deployment.
+    state_file: str | None = None
+    # How often recorded spend is written out. A crash can lose up to this
+    # much recorded spend; see core.persistence for why it is not zero.
+    state_flush_interval_s: float = 2.0
     # Ordered failover candidates per model. A model with no entry maps to the
     # provider of the same name, so single-provider setups need no routes at all.
     routes: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -195,6 +201,13 @@ class GatewayConfig:
             raise ConfigError("gateway.max_concurrency must be >= 1")
         if self.drain_timeout_s < 0:
             raise ConfigError("gateway.drain_timeout_s must be >= 0")
+        if self.state_flush_interval_s <= 0:
+            raise ConfigError(
+                "gateway.state_flush_interval_s must be > 0: flushing on every "
+                "settle would put a disk write on every request's completion path"
+            )
+        if self.state_file is not None and not self.state_file.strip():
+            raise ConfigError("gateway.state_file must be a path, or absent")
         if self.admin_key_sha256 is not None and len(self.admin_key_sha256) != 64:
             raise ConfigError("gateway.admin_key_sha256 must be a 64-char hex digest")
         self.timeouts.validate()
@@ -292,7 +305,8 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> GatewayConfig:
     tenants = tuple(_tenant_from_toml(dict(t)) for t in raw.get("tenants", []))
 
     known = {"max_concurrency", "scheduling_policy", "fleet_url", "providers",
-             "drain_timeout_s", "admin_key_sha256"}
+             "drain_timeout_s", "admin_key_sha256", "state_file",
+             "state_flush_interval_s"}
     unknown = set(gateway_raw) - known
     if unknown:
         raise ConfigError(f"[gateway]: unknown field(s) {sorted(unknown)}")
@@ -351,6 +365,9 @@ def render_toml(config: GatewayConfig) -> str:
         f"drain_timeout_s = {config.drain_timeout_s}",
         "providers = [" + ", ".join(f'"{p}"' for p in config.providers) + "]",
     ]
+    # `state_file` is deliberately not carried across. Verification runs a copy
+    # of the configuration against synthetic providers; pointing that copy at
+    # the real spend file would have a dry run charge real budgets.
     if config.admin_key_sha256:
         lines.append(f'admin_key_sha256 = "{config.admin_key_sha256}"')
     lines += [

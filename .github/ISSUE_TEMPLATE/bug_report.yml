@@ -1,0 +1,28 @@
+name: Bug report
+description: Something behaves differently from how it is documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations: {required: true}
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `switchyard check`
+      description: Redact the key digests. This pins down most configuration issues immediately.
+      render: text
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: >
+        If it involves load, the output of `switchyard verify` or a scenario
+        run says more than a description does.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`switchyard --version`, or the commit."

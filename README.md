@@ -1,12 +1,23 @@
+<div align="center">
+
 # Switchyard
 
 **An LLM gateway you can break on purpose.**
 
-Switchyard is a self-hostable multi-tenant gateway that schedules scarce
-inference capacity fairly, enforces token budgets, and keeps serving when
-providers fail. It ships with the harness that proves it — break a provider
-mid-traffic, flood one tenant, and watch what happens, with no LLM API key and
-no spend.
+Multi-tenant scheduling for scarce inference capacity — token-fair queueing,
+hard budgets, and failover that ships with the harness that proves it.
+
+[![CI](https://github.com/JeyaViknan/Switchyard/actions/workflows/ci.yml/badge.svg)](https://github.com/JeyaViknan/Switchyard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://img.shields.io/badge/tests-356%20passing-brightgreen.svg)](#testing)
+[![Status: beta](https://img.shields.io/badge/status-beta-yellow.svg)](#project-status)
+
+[Quickstart](#quickstart) · [Why](#why-you-would-want-this) · [Results](#measured-results) · [Install](#install) · [Configure](#configure) · [Status](#project-status) · [Design notes](docs/decisions.md)
+
+</div>
+
+---
 
 ```bash
 git clone https://github.com/JeyaViknan/Switchyard && cd Switchyard
@@ -14,46 +25,61 @@ make install
 make scenario noisy-neighbour
 ```
 
-Or the whole story in one command: `make demo`. A recorded run is in
-[docs/demo.md](docs/demo.md).
+Sixty seconds, no API key, no spend. One tenant floods the gateway at 25× the
+rate of its neighbour, and you watch the neighbour not care.
 
 ---
 
-## The problem
+## Why you would want this
 
-Put several tenants behind one set of LLM providers and two things go wrong.
+Put several teams, products or customers behind one pool of LLM capacity and
+two things break that ordinary gateways do not fix.
 
 **Capacity is not fungible.** A request holds a provider slot for as long as it
 takes to generate, and how long that is depends on output length — which the
-caller does not declare and the model does not promise. Rate limiting by
-requests per second allocates the wrong thing.
+caller does not declare and the model does not promise. Limiting by
+requests-per-second allocates the wrong unit entirely. One tenant sending
+4,000-token completions consumes roughly ten times the resource of one sending
+400-token completions at the same rate, and is charged the same.
 
 **Failure is not uniform.** A provider that is slow, a provider returning 5xx,
-and a provider that answered and then stalled all need different responses. One
-timeout treats them identically and makes all three wait its full duration.
+and a provider that answered and then went silent mid-stream need three
+different responses. A single timeout treats them identically and makes all
+three wait its full duration.
 
-## What Switchyard does
+Switchyard schedules in **tokens**, enforces budgets as a **hard bound**, and
+decomposes failure so each kind gets the handling it needs.
 
-- **Weighted fair scheduling** across tenants, measured in **tokens**, with
-  reserved floors that guarantee capacity and ceilings that cap it.
-- **Admission control** with bounded queues and deadlines, so overload sheds
-  load instead of accumulating work nobody is waiting for.
-- **Hard token budgets** — reserve, settle, and clamp `max_tokens` so spend
-  cannot exceed a limit.
-- **Timeout decomposition** into connect / first-token / inter-token / total,
-  each producing a distinct, differently-handled failure.
-- **Phased failover** and circuit breaking that route around a failing provider
-  without ever splicing two answers together.
-- **Graceful drain** that refuses queued work and lets running work finish.
+### Who it is for
 
-## Why it is different
+| You have | Switchyard gives you |
+|---|---|
+| **A self-hosted vLLM/Ollama box shared by several teams** | The case it is built for. Capacity is genuinely fixed, so fair-share scheduling decides who waits. |
+| **One API account fronting several products or customers** | Per-tenant floors, ceilings, weights and token budgets that cannot be overrun. |
+| **An internal platform billing teams for LLM spend** | Spend metered per tenant, clamped at the limit, and durable across restarts. |
+| **A gateway you need to justify to someone** | `switchyard verify` runs your actual config under adversarial load and reports what it measured. |
 
-Most gateways can be configured. Switchyard can be **interrogated**.
+### Who it is not for
 
-The synthetic provider fleet and load generator are product features, not test
-scaffolding. That means you can watch the scheduler protect a tenant, watch a
-breaker open, and ask whether *your* configuration actually delivers what it
-promises — in under a minute, with nothing to sign up for.
+Worth saying plainly, because the wrong adoption helps nobody:
+
+- **You call one hosted API as one team.** Capacity is elastic; buy more. You
+  do not have a scheduling problem.
+- **You need 100 provider integrations.** Use [LiteLLM](https://github.com/BerriAI/litellm).
+  Switchyard speaks one wire format — OpenAI-compatible — on purpose.
+- **You need HA today.** Switchyard is a single process. A crash is an outage.
+
+### How it compares
+
+| | Switchyard | Typical LLM gateway |
+|---|---|---|
+| Fairness unit | **Tokens**, settled against actual consumption | Requests per minute |
+| Capacity guarantee | **Reserved floors** per tenant + shared pool | Global limit, first-come-first-served |
+| Budget enforcement | **Hard** — reservation is the ceiling, `max_tokens` clamped | Advisory; overrun is detected after the fact |
+| Mid-stream failure | Typed terminal error with tokens delivered | Stream just stops |
+| Timeouts | Four: connect / first-token / inter-token / total | One |
+| Provider coverage | Any OpenAI-compatible endpoint | Dozens of bespoke adapters |
+| Can you test its claims? | **`switchyard verify`, against your own config** | Read the docs and hope |
 
 ---
 
@@ -61,22 +87,24 @@ promises — in under a minute, with nothing to sign up for.
 
 ```bash
 make install
-make dev          # gateway :8000, synthetic providers :8100
 ```
 
 ```bash
-curl -sN localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer sk_sy_acme_b6525e6c60405226fc726bdda422dd2f" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"fast","messages":[{"role":"user","content":"hello"}],"stream":true}'
+make dev
 ```
 
-The keys in `switchyard.toml` are development keys, committed so a fresh
-checkout works immediately. They are minted against a built-in development
-pepper and are worthless anywhere that sets `SWITCHYARD_KEY_PEPPER`. Mint real
-ones with `switchyard keys mint <tenant>`.
+Gateway on `:8000`, synthetic provider fleet on `:8100`. Then:
 
-Watch it live, from another terminal:
+```bash
+curl -sN localhost:8000/v1/chat/completions -H "Authorization: Bearer sk_sy_acme_b6525e6c60405226fc726bdda422dd2f" -H 'Content-Type: application/json' -d '{"model":"fast","messages":[{"role":"user","content":"hello"}],"stream":true}'
+```
+
+The keys in [`switchyard.toml`](switchyard.toml) are development keys, committed
+so a fresh checkout works immediately. They are minted against a built-in
+development pepper and are worthless anywhere that sets `SWITCHYARD_KEY_PEPPER`.
+Mint real ones with `switchyard keys mint <tenant>`.
+
+### Watch it work
 
 ```bash
 switchyard top --key sk_sy_admin_672e27a104b9ede9182f129f4b288395
@@ -98,6 +126,9 @@ switchyard http://127.0.0.1:8000   policy drr   capacity ########.... 16/24   qu
 
 ## Break it on purpose
 
+The synthetic provider fleet and the load generator are product features, not
+test scaffolding. You can reproduce every number below on your laptop.
+
 ### A tenant floods the gateway
 
 ```bash
@@ -105,7 +136,7 @@ make scenario noisy-neighbour
 ```
 
 One tenant runs alone to establish its normal, then a neighbour starts sending
-twenty-five times more. The protected tenant's numbers barely move.
+twenty-five times more.
 
 ```
     8.1s  >> noisy tenant starts flooding at 25 req/s (25x the quiet tenant)
@@ -123,11 +154,11 @@ twenty-five times more. The protected tenant's numbers barely move.
 ```
 
 The floor is what bounds latency, and it has to be sized: a tenant needs
-`offered rate x seconds per request` slots, and anything beyond that comes from
+`offered rate × seconds per request` slots, and anything beyond that comes from
 contended capacity where the neighbour's flood shows up in its latency. The
 scenario prints that arithmetic so the sizing can be checked rather than assumed.
 
-Run it with `--policy fifo` to see the same workload without fair scheduling.
+Run it with `--policy fifo` to watch the same workload without fair scheduling.
 
 ### A provider dies mid-traffic
 
@@ -159,19 +190,165 @@ ends with a typed error carrying exactly how many tokens arrived.
 
 ---
 
+## Measured results
+
+Every figure is regenerated from scratch by `make bench`. If a plot cannot be
+reproduced by one command, it is not evidence.
+
+### Fair scheduling protects a tenant from its neighbours
+
+<img src="plots/fairness.svg" alt="Token share and latency under contention, FIFO versus weighted fair queueing" width="100%">
+
+Three tenants, one of them flooding. Same workload, same capacity, two policies:
+
+| Interactive tenant | FIFO | Token-fair (DRR) | |
+|---|---|---|---|
+| Queue wait p95 | 19,980 ms | **273 ms** | **73× lower** |
+| Latency p95 | 24,449 ms | **5,522 ms** | **4.4× lower** |
+| Token share | 9.2% | **13.5%** | closer to its weight |
+
+Under FIFO the interactive tenant waits behind the flood and gets 9% of
+capacity. Under weighted fair queueing it is served almost immediately.
+
+### Failover survives a total provider outage
+
+<img src="plots/outage.svg" alt="Client-visible error rate through a provider outage, with and without failover" width="100%">
+
+A provider returns 5xx for every request for 18 seconds, under live traffic:
+
+| | Single provider | With failover |
+|---|---|---|
+| Served during the outage | 16 / 120 — **13%** | 48 / 48 — **100%** |
+| Peak client-visible error rate | **100%** | **0%** |
+| Transparent failovers | 0 | 26 |
+| Requests that skipped the dead provider | 176 | 34 |
+
+The breaker opens, traffic routes to the standby, and clients see nothing. When
+the provider recovers, a bounded half-open probe lets it back in.
+
+### Baseline behaviour
+
+[Latency vs. offered load](plots/baseline_latency_vs_load.svg) ·
+[Latency CDF](plots/baseline_latency_cdf.svg) ·
+[Time-to-first-token CDF](plots/baseline_ttft_cdf.svg)
+
+Load is generated **open-loop** — Poisson arrivals, not a fixed worker pool — so
+the latency numbers are free of coordinated omission. The generator records
+intended start against actual start to prove it.
+
+---
+
+## Install
+
+### From source
+
+Works today, and is what the scenarios and benchmarks expect:
+
+```bash
+git clone https://github.com/JeyaViknan/Switchyard && cd Switchyard && make install
+```
+
+### Docker Compose
+
+Gateway, synthetic fleet, Prometheus and a provisioned Grafana dashboard:
+
+```bash
+make up
+```
+
+Gateway on `:8000`, Grafana on `:3000`. Tenant spend lives on a named volume, so
+it survives restarts. `make down` tears it all down including the volume.
+
+### From PyPI
+
+Published as `switchyard-gateway` (the name `switchyard` was already taken; the
+installed command is still `switchyard`), from the first tagged release onward:
+
+```bash
+pip install switchyard-gateway
+```
+
+### Container image
+
+```bash
+docker pull ghcr.io/jeyaviknan/switchyard:latest
+```
+
+Both of the above are wired up in
+[`.github/workflows/release.yml`](.github/workflows/release.yml) and publish on
+a `v*` tag. See [Project status](#project-status) for what has actually shipped.
+
+---
+
+## Configure
+
+A minimal two-tenant gateway:
+
+```toml
+[gateway]
+max_concurrency = 24          # what the upstream can absorb, not what you can hold open
+scheduling_policy = "drr"     # "drr" for weighted fair sharing, "fifo" for the baseline
+state_file = "/var/lib/switchyard/state.json"   # keeps spend across restarts
+
+[routes]
+fast = ["openai", "local"]    # fall back to the local model when OpenAI is down
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"     # read from the environment, never stored here
+upstream_model = "gpt-4o-mini"
+
+[providers.local]
+base_url = "http://localhost:11434/v1"   # Ollama, vLLM, anything OpenAI-compatible
+
+[[tenants]]
+id = "acme"
+key_sha256 = "..."            # switchyard keys mint acme
+weight = 3.0
+reserved_concurrency = 6      # capacity nobody else can take
+max_concurrency = 18          # ceiling, so it cannot take everything
+budget_tokens = 2_000_000
+```
+
+Providers with no `[providers.<name>]` section resolve to the built-in synthetic
+fleet, which is why a fresh checkout needs no credentials at all.
+
+### Sizing the floors
+
+A tenant needs `offered_rate × seconds_per_request` concurrent slots to be
+served without queueing — Little's law. Below that it waits; above it, the extra
+comes from contended capacity. `switchyard verify` measures the seconds per
+request for you and prints the arithmetic.
+
+### Budgets survive restarts
+
+Set `gateway.state_file` and per-tenant spend is written atomically and reloaded
+at startup. Without it, a restart hands every tenant a fresh allowance — which
+`switchyard check` will tell you about rather than leaving you to discover.
+
+A crash can lose at most `state_flush_interval_s` of recorded spend (default 2s),
+so a tenant is briefly under-charged, never over-charged. Writing on every
+request is deliberately not offered: an `fsync` per completion would make a
+gateway whose whole job is throughput wait on a disk.
+
+---
+
 ## Does *your* configuration hold?
 
 ```bash
-switchyard check     # instant: is it valid, and what does it mean?
-switchyard verify    # ~35s: does it behave that way under load?
+switchyard check
 ```
 
-`check` is static and starts nothing:
+Static, instant, starts nothing:
 
 ```
     PASS  capacity is fully allocatable        12 reserved of 24, 12 shared
     PASS  tenants are isolated from each other 3 of 3 tenants have a reserved floor
+    PASS  no tenant can take the whole gateway 3 of 3 have a ceiling
     PASS  operational endpoints are protected  admin key configured
+    SKIP  budgets survive a restart            no gateway.state_file set: 3 budgeted
+                                               tenant(s) start again from zero spend
+          -> set gateway.state_file to a writable path to keep spend across restarts
 
   What this configuration means
     capacity          24 concurrent requests: 12 reserved as floors, 12 shared
@@ -181,8 +358,12 @@ switchyard verify    # ~35s: does it behave that way under load?
     circuit breaker   opens after about 25 failures within the last 50
 ```
 
-`verify` runs your configuration — every limit, weight, floor, budget and route
-— against the synthetic fleet, then reports what it measured:
+```bash
+switchyard verify
+```
+
+~35s. Runs your configuration — every limit, weight, floor, budget and route —
+against the synthetic fleet, then reports what it measured:
 
 ```
     tenant 'acme'     floor 6, ceiling 18, 60% of contended capacity
@@ -195,143 +376,159 @@ switchyard verify    # ~35s: does it behave that way under load?
     PASS  shutdown finishes running work           2 in flight finished in 0.8s
 ```
 
-It never calls your real providers, and exits non-zero on failure so it can gate
+It never calls your real providers and exits non-zero on failure, so it can gate
 a deploy. A guarantee your configuration does not claim is reported as `SKIP`
 with what to add, not silently passed.
 
 ---
 
-## Architecture
+## API
 
-Single process, single replica. Everything the scheduler needs is correct in
-memory.
+OpenAI-compatible, so existing SDKs work by changing the base URL.
 
-```
-                 ┌──────────────────────────────────────────────┐
-   client ──────▶│  GATEWAY                                     │
-   (OpenAI-      │                                              │
-    compatible)  │   auth ──▶ validate ──▶ estimate cost        │
-                 │                              │               │
-                 │                              ▼               │
-                 │   ┌──────────────────────────────────────┐   │
-                 │   │ ADMISSION + SCHEDULER                │   │
-                 │   │  reserved floors │ shared pool       │   │
-                 │   │  bounded queues  │ deadlines         │   │
-                 │   │  weighted fair queueing, in tokens   │   │
-                 │   └──────────────┬───────────────────────┘   │
-                 │                  │ capacity lease            │
-                 │                  ▼                           │
-                 │   ┌──────────────────────────────────────┐   │
-                 │   │ BUDGET LEDGER                        │   │
-                 │   │  reserve ceiling │ clamp │ settle    │   │
-                 │   └──────────────┬───────────────────────┘   │
-                 │                  ▼                           │
-                 │   ┌──────────────────────────────────────┐   │
-                 │   │ PROVIDER ROUTER                      │   │
-                 │   │  candidates │ phased failover        │   │
-                 │   │  circuit breakers │ health           │   │
-                 │   └──────────────┬───────────────────────┘   │
-                 │                  ▼                           │
-                 │   stream pump ──▶ SSE ──▶ settle ──▶ client  │
-                 └──────────────────┬───────────────────────────┘
-                                    ▼
-                 ┌──────────────────────────────────────────────┐
-                 │ PROVIDERS                                    │
-                 │  synthetic fleet (built in, no API key)      │
-                 │  + your own adapters                         │
-                 └──────────────────────────────────────────────┘
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /v1/chat/completions` | tenant | Streaming and non-streaming completions |
+| `GET /health` | none | Liveness |
+| `GET /metrics` | admin | Prometheus exposition |
+| `GET /v1/scheduler/stats` | admin | Live queues, capacity, per-tenant budgets |
+| `GET /v1/providers` | admin | Provider health and breaker state |
+| `POST /v1/admin/drain` | admin | Refuse queued work, let running work finish |
 
-   observability          instruments
-   ─────────────          ───────────
-   /metrics  Prometheus   scenarios    break it on purpose
-   /v1/providers  health  verify       check your own config
-   structured logs        top          live operational view
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="sk_sy_acme_...")
+stream = client.chat.completions.create(
+    model="fast",
+    messages=[{"role": "user", "content": "hello"}],
+    stream=True,
+)
 ```
 
-A capacity lease is an async context manager, so completion, provider failure,
-client disconnect and unexpected exceptions all release through one path. A
-failover reuses the same lease and the same budget reservation — a retry is
-still one request competing for capacity.
+Admin endpoints take a separate credential from tenant keys: they expose every
+tenant's usage and can take the gateway out of service, so no single tenant
+should hold them.
+
+---
 
 ## Observability
 
-`/metrics` exposes per-tenant queue wait, queue depth, token throughput, budget
-headroom, breaker state, failovers, terminal failures split by whether tokens
-had already been delivered, and event-loop lag. The Grafana dashboard has eleven
-panels covering traffic, scheduling, tenants and providers.
+`make up` brings up Prometheus and Grafana with an 11-panel dashboard already
+provisioned — capacity in use, per-tenant queue depth and token share, breaker
+state, TTFT and inter-token latency, budget headroom, admission rejections by
+reason.
 
-Logs are structured, `text` by default and `json` via `SWITCHYARD_LOG_FORMAT`.
-Notable events log at INFO; one line per request at DEBUG. **Prompts, responses
-and credentials are never logged** — the logging helper rejects those field
-names outright.
+Structured logs in text or JSON (`SWITCHYARD_LOG_FORMAT=json`). The logging
+layer **refuses** a known set of field names, so logging a prompt is a loud
+failure rather than a silent leak.
+
+---
+
+## Testing
 
 ```bash
-make up   # gateway :8000, fleet :8100, prometheus :9090, grafana :3000
+make check      # ruff, mypy, 356 tests -- about a minute
+make test-all   # adds the scenario end-to-end tests, which run real load
+make bench      # regenerate every figure in plots/
 ```
 
-## Using a real provider
+mypy runs with `disallow_untyped_defs` on `switchyard.core` and
+`switchyard.adapters` — the scheduler, budgets and routing, where a type error
+costs real money. Benchmark tooling and the synthetic fleet are instruments, and
+are not held to it.
 
-Everything above runs on the built-in synthetic fleet, which is why it needs no
-API key. Switchyard speaks one upstream format — OpenAI chat completions — so
-pointing it at a real provider is configuration, not code:
+---
 
-```toml
-[gateway]
-providers = ["openai", "local"]
+## Project status
 
-[providers.openai]
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"       # read from the environment, never stored
-upstream_model = "gpt-4o-mini"
+**Beta.** Complete and tested for its intended shape: a single-replica,
+self-hosted gateway. Not yet proven in production by anyone, including its
+author — see [what this is not](#what-this-is-not).
 
-[providers.local]
-base_url = "http://localhost:11434/v1"   # Ollama, vLLM, anything compatible
+### Completeness
 
-[routes]
-fast = ["openai", "local"]           # fall back to local when OpenAI is down
-```
+| Subsystem | Status | Evidence |
+|---|---|---|
+| Token-fair scheduling, floors, ceilings | **Complete** | `noisy-neighbour`, fairness benchmark, 73× queue-wait improvement |
+| Admission control, bounded queues, deadlines | **Complete** | Unit + property tests, scheduler stats |
+| Hard token budgets, clamping, settlement | **Complete** | `test_budget.py`, clamp path exercised end to end |
+| Durable spend across restarts | **Complete** | `test_persistence.py`, restart test |
+| Timeout decomposition | **Complete** | `test_timeouts.py`, four distinct error classes |
+| Circuit breaking + phased failover | **Complete** | `provider-outage`, 100% survival through a total outage |
+| Graceful drain | **Complete** | Drain test, `verify` check |
+| OpenAI-compatible providers | **Complete** | `test_providers.py` against a key-enforcing stub |
+| Verification harness (`check` / `verify`) | **Complete** | 11 checks, exits non-zero |
+| CLI, `top`, scenarios | **Complete** | `test_cli.py`, `test_scenarios.py` |
+| Metrics, dashboard, structured logging | **Complete** | Provisioned Grafana, redaction guard |
+| Docker Compose deployment | **Complete** | Healthchecks, state volume |
+| **Live traffic against a paid provider** | **Not done** | Path is tested; no real spend has run through it |
+| **High availability / multi-replica** | **Not planned for 1.0** | In-process scheduler is a deliberate choice |
+| PyPI + GHCR publication | **Automated, not yet tagged** | `release.yml` publishes on `v*` |
 
-The demo path and the production path run the same adapter — the synthetic fleet
-is an OpenAI-compatible endpoint like any other, not a special case. Scheduling,
-budgets, breakers and failover behave identically either way.
+### Milestones
 
-## Deployment
+- [x] **M1 — Measurement rig.** Synthetic fleet, open-loop load generator,
+      reproducible figures. *Without this first, nothing after it is credible.*
+- [x] **M2 — The scheduler.** Weighted fair queueing in tokens, floors,
+      ceilings, admission control, budgets.
+- [x] **M3 — Reliability.** Timeout decomposition, circuit breaking, phased
+      failover, cancellation, graceful drain.
+- [x] **M4 — Product surface.** CLI, scenarios, `check`/`verify`, dashboard,
+      deployment, real providers.
+- [x] **M5 — Durability.** Spend that survives a restart.
+- [ ] **M6 — First tagged release.** `v0.1.0` to PyPI and GHCR.
+- [ ] **M7 — A real deployment.** Live traffic through a paid provider, and the
+      numbers from it published here.
+- [ ] **M8 — Budget windows.** Monthly refill rather than lifetime totals.
 
-One process plus the synthetic fleet, or one process pointed at real providers.
-Docker Compose is the supported path and is verified end to end: build, health,
-authenticated scrape, provisioned dashboard.
+### Roadmap, and what is deliberately excluded
 
-`switchyard.toml` is mounted rather than baked into the image, so limits can
-change without a rebuild. For anything real, set `SWITCHYARD_KEY_PEPPER` and
-mint fresh keys — the committed ones become worthless the moment you do.
+Planned: budget refill windows · per-tenant model allowlists · a prefix-aware
+routing policy for self-hosted vLLM, where routing to the replica that already
+holds the KV prefix is the single largest available win.
 
-There is no Kubernetes, no Redis, no message broker. Nothing in the product
-needs them, and a single replica is the honest scope.
+Excluded on purpose, with reasons in [`docs/decisions.md`](docs/decisions.md):
+Kubernetes manifests · a message broker · a distributed queue · a plugin
+framework · a web admin UI · dozens of provider adapters. Each would add
+surface area without adding a guarantee.
 
-## CLI
-
-| | |
-|---|---|
-| `switchyard serve` | run the gateway |
-| `switchyard check` | is my configuration valid, and what does it mean? |
-| `switchyard top` | what is happening right now? |
-| `switchyard scenario <name>` | show me what happens in a specific situation |
-| `switchyard verify` | does my configuration behave as intended? |
-| `switchyard keys mint <id>` | mint a tenant or `--admin` credential |
+---
 
 ## What this is not
 
-Not a production system. No HA, no secrets management, no compliance story, no
-multi-region. It is a working gateway with the engineering properties above
-demonstrated and measured, not a hosted service.
+Not a production system, and saying so is cheaper than having you find out.
 
-## Layout
+- **No HA.** Single process. A crash is an outage; spend survives it if
+  `state_file` is set, in-flight requests do not.
+- **No TLS, no secrets manager.** Run it behind a terminating proxy; provider
+  keys come from the environment.
+- **Budgets are lifetime totals.** No monthly reset yet (M8).
+- **No one has run it in production**, including me. The guarantees are
+  demonstrated under synthetic load, which is a real but different claim.
+
+See [SECURITY.md](SECURITY.md) for the full boundary.
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/decisions.md`](docs/decisions.md) | Why the system is built this way — including the bugs found along the way and what they changed |
+| [`docs/demo.md`](docs/demo.md) | A recorded end-to-end run |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed, when |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to work on it |
+| [`SECURITY.md`](SECURITY.md) | What is protected, and what is not |
+
+### Layout
 
 ```
 src/switchyard/
-  core/        config, auth, scheduler, queue policies, prediction, budgets, health, routing
+  core/        config, auth, scheduler, queue policies, prediction, budgets,
+               health, routing, persistence
   gateway/     HTTP surface and the SSE pump
-  adapters/    provider implementations
+  adapters/    OpenAI-compatible provider client
   obs/         metrics and structured logging
   synthetic/   the provider fleet
   scenarios/   runnable demonstrations
@@ -339,15 +536,14 @@ src/switchyard/
   verify.py    configuration verification
 ```
 
-`docs/decisions.md` records why the system is built the way it is, including the
-mistakes found along the way.
+---
 
-## Development
+## Contributing
 
-```bash
-make check      # ruff, mypy, tests
-make test-all   # including the slow scenario tests
-make bench      # regenerate every figure in plots/
-```
+Issues and pull requests welcome — read [CONTRIBUTING.md](CONTRIBUTING.md)
+first, particularly the part about what the project optimises for. The short
+version: every component should enforce an invariant or produce a number.
 
-MIT licensed.
+## License
+
+[MIT](LICENSE).

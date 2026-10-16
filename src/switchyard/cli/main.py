@@ -145,6 +145,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="switchyard",
         description="Multi-tenant LLM gateway: fair scheduling, budgets, failover.",
     )
+    # Imported here rather than at module scope: the other switchyard imports
+    # in this file are deferred to keep `switchyard --help` fast, and reading
+    # installed package metadata is not free either.
+    from switchyard import __version__
+
+    parser.add_argument(
+        "--version", action="version", version=f"switchyard {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="run the gateway")

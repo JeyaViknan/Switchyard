@@ -466,3 +466,81 @@ Verified end to end: build, healthy start, authenticated Prometheus scrape,
 provisioned Grafana dashboard with every panel returning data. Nothing in the
 product needs an orchestrator, and a single replica is the honest scope for a
 scheduler whose state is correct in memory.
+
+## Week 4 -- durable spend
+
+### A budget bounded by process uptime is not a budget
+
+Everything else in the gateway is safely ephemeral. Queues drain, leases
+expire, the output-length predictor re-converges in a few hundred requests,
+and a circuit breaker re-learns provider health within seconds of restarting.
+Spend does not re-learn. A tenant that had consumed 95% of its allowance
+before a deploy came back at zero.
+
+That made the hard bound the budget ledger works to maintain -- reservation at
+the ceiling, `max_tokens` clamped to remaining headroom, so overrun is
+impossible by construction -- bounded in practice by how often the process
+restarted. The invariant was real and the guarantee was not.
+
+So `spent` is written to a file and read back at startup. Nothing else is:
+`reserved` covers in-flight requests, and after a restart nothing is in
+flight, so persisting it would permanently leak headroom from every tenant
+that was busy when the gateway went down.
+
+### A JSON file, not a database
+
+The dataset is one integer per tenant. Tens of rows, a few hundred bytes. A
+database would contribute a schema, a migration path and a failure domain to
+hold less data than this section.
+
+The file is written whole to a temporary file in the same directory, fsynced,
+and moved into place with `os.replace`. A crash mid-write therefore leaves the
+previous version intact rather than a truncated one -- a torn state file is
+worse than a stale one, because the stale one still parses. Being plain text
+also matters more than it sounds: an operator asking what a tenant has
+actually spent can answer it with `cat`.
+
+### The durability bound is stated, and write-through is refused
+
+Flushing on every settle was the obvious first design and is wrong. It puts an
+fsync on the completion path of every request, which would make a gateway
+whose entire purpose is scheduling throughput wait on a disk several hundred
+times a second.
+
+Instead writes are batched on an interval, with one more flush after drain so
+that requests finishing during shutdown are included. The cost is a stated
+bound: a crash can lose up to `state_flush_interval_s` of recorded spend. The
+direction of that error matters and is worth being explicit about -- a tenant
+is briefly **under**-charged for requests that completed inside the last
+window, never over-charged. Tightening it means shortening the interval, not
+making the write synchronous.
+
+`state_flush_interval_s = 0` is rejected by config validation rather than
+silently accepted, because the configuration that asks for it is asking for
+the behaviour that was deliberately not built.
+
+### Refusing to start beats starting wrong
+
+A state file that cannot be parsed, carries a version this build does not
+write, or contains a negative spend raises at app-factory time -- before the
+port is bound. The alternative is a gateway that reports itself healthy while
+serving every tenant a fresh budget, which is the exact failure the file
+exists to prevent, arriving silently.
+
+A tenant in the file but absent from the configuration is ignored rather than
+dropped: its total is merged back in on the next write, so removing a tenant
+for a day does not quietly refund it.
+
+### Found while testing it
+
+Writing the failure-path tests surfaced that `mkdir` sat outside the `try`
+block in the save path, so a state file whose parent directory could not be
+created raised a bare `OSError` while every other write failure raised
+`StateError`. Callers catching the documented exception would have missed it.
+Moving one line fixed it; the test that found it is
+`test_existing_file_survives_a_failed_write`.
+
+The static review also gained a `budgets survive a restart` check. It reports
+`SKIP` rather than `FAIL` when no state file is configured, because running
+without one is a legitimate choice for a demo -- but it should be a chosen one,
+not a discovered one.

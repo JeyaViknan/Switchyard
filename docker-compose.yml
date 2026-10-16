@@ -27,10 +27,14 @@ services:
       SWITCHYARD_FLEET_URL: http://fleet:8100
       SWITCHYARD_CONFIG: /app/switchyard.toml
       SWITCHYARD_LOG_FORMAT: json
-    # Mounted rather than baked into the image: configuration carries
-    # credentials, and editing limits should not require a rebuild.
+      # Tenant spend, on a named volume. Without this a restart would hand
+      # every tenant a fresh budget, which is not what a budget means.
+      SWITCHYARD_STATE_FILE: /var/lib/switchyard/state.json
     volumes:
+      # Mounted rather than baked into the image: configuration carries
+      # credentials, and editing limits should not require a rebuild.
       - ./switchyard.toml:/app/switchyard.toml:ro
+      - switchyard-state:/var/lib/switchyard
     ports: ["8000:8000"]
     depends_on:
       fleet: {condition: service_healthy}
@@ -56,3 +60,8 @@ services:
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
     depends_on: [prometheus]
+
+volumes:
+  # Survives `docker compose restart` and `up --build`. Removed by
+  # `docker compose down -v`, which is why `make down` is the reset.
+  switchyard-state:

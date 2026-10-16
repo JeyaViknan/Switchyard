@@ -51,7 +51,27 @@ def outcomes(checks) -> dict[str, Outcome]:
 
 
 def test_a_healthy_configuration_passes_the_static_review():
-    assert set(outcomes(review(config())).values()) == {Outcome.PASS}
+    """Fully specified: floors, ceilings, an admin key, budgets, and durable spend."""
+    healthy = config(
+        state_file="/var/lib/switchyard/state.json",
+        tenants=(
+            tenant("a", reserved_concurrency=4, max_concurrency=8, budget_tokens=10_000),
+            tenant("b", reserved_concurrency=2, max_concurrency=6, budget_tokens=10_000),
+        ),
+    )
+    assert set(outcomes(review(healthy)).values()) == {Outcome.PASS}
+
+
+def test_budgets_without_a_state_file_are_flagged():
+    """Enforcement bounded by process uptime is not enforcement."""
+    checks = outcomes(review(config(
+        tenants=(tenant("a", budget_tokens=10_000),),
+    )))
+    assert checks["budgets survive a restart"] is Outcome.SKIP
+
+
+def test_no_budgets_means_nothing_to_persist():
+    assert outcomes(review(config()))["budgets survive a restart"] is Outcome.SKIP
 
 
 def test_isolation_is_skipped_when_there_is_only_one_tenant():
