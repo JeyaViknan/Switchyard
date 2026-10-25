@@ -67,6 +67,13 @@ packages = ["src/switchyard"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Eleven call sites do `from tests.conftest import ...` to reuse the gateway
+# fixtures, which needs the repository root importable. `python -m pytest`
+# happens to provide that -- it prepends the working directory to sys.path --
+# but the `pytest` console script does not, so CI collected nothing for two
+# months while the Makefile stayed green. State the path requirement here so
+# the suite runs the same way however it is launched.
+pythonpath = ["."]
 filterwarnings = ["error::DeprecationWarning"]
 # Scenario end-to-end tests start real servers and drive seconds of load, so
 # they are excluded by default to keep the edit-test loop fast. `make test-all`

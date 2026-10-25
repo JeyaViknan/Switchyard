@@ -6,17 +6,36 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: the image migrates (Ubuntu 26 from 19 Oct
+    # 2026) and an unpinned runner changes under you with no commit to blame.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
       - run: pip install -e ".[dev,bench]"
+      # This job was red for two months while the same commit passed locally.
+      # Record what the runner actually resolved, so the next red run is
+      # diagnosable from its own log instead of by guessing.
+      - name: Environment
+        run: |
+          python -VV
+          uname -a
+          pip --version
+          pip freeze
       - run: ruff check src tests
       - run: mypy src/switchyard/core src/switchyard/adapters src/switchyard/types.py
+      # ruff and mypy never import the package, so an import error reaches us
+      # only here. Collecting separately keeps "the suite could not load" and
+      # "a test failed" from looking like the same red X.
+      - name: Collect tests
+        run: pytest --collect-only -q
       - run: pytest -q
 
   # The benchmark suite is not run on every push: it needs a quiet machine to
@@ -25,15 +44,15 @@ jobs:
   # controlled environment, not from here.
   bench:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.14"
       - run: pip install -e ".[dev,bench]"
       - run: make bench-baseline
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: benchmark-figures
           path: plots/

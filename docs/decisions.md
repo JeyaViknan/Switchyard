@@ -544,3 +544,74 @@ The static review also gained a `budgets survive a restart` check. It reports
 `SKIP` rather than `FAIL` when no state file is configured, because running
 without one is a legitimate choice for a demo -- but it should be a chosen one,
 not a discovered one.
+
+## M0 -- why CI was red for two months and what changed
+
+### The symptom
+
+Every push from 28 August onward failed. The only green run was the first one.
+`ruff` and `mypy` passed every time; `pytest -q` exited with code 2 after about
+four seconds. The same commit, in a clean clone, passed locally on both 3.13
+and 3.14. That combination is what made it easy to ignore: the failure looked
+like a runner problem, and the tests "obviously" worked.
+
+### The cause
+
+`tests/test_reliability.py` imports fixtures at module scope:
+
+```python
+from tests.conftest import build_tenant_config, serve_gateway
+```
+
+Ten other call sites do the same inside functions. All of them need the
+repository root on `sys.path`, because `tests` is only importable as a package
+from there.
+
+`python -m pytest` puts it there -- running a module with `-m` prepends the
+working directory to `sys.path`. The `pytest` console script does not. The
+Makefile uses `$(PY) -m pytest`; CI ran `pytest -q`. One line of difference,
+and it decided whether the suite could import itself.
+
+Exit code 2 is pytest's `INTERRUPTED`, raised when collection fails -- not a
+failing assertion. Four seconds was import time. Because collection aborted at
+the first module-scope import, **the suite never ran at all on CI**: the other
+ten call sites had not even been reached.
+
+### The fix, and why it is this one
+
+```toml
+[tool.pytest.ini_options]
+pythonpath = ["."]
+```
+
+The real defect was not the invocation, it was depending on a side effect of
+it. Changing CI to `python -m pytest` would have turned the job green while
+leaving the suite just as fragile -- the next person to run `pytest` would hit
+the same wall. Declaring the path requirement in configuration makes the suite
+run identically however it is launched, which is the property that was missing.
+
+Verified both ways: `pytest -q` and `python -m pytest -q` each report 356
+passed.
+
+### What else changed, so this class of failure is visible sooner
+
+- `runs-on: ubuntu-24.04` instead of `ubuntu-latest`. The hosted image began
+  migrating to Ubuntu 26 on 19 October; an unpinned runner changes with no
+  commit to point at. That was a second outage waiting to happen.
+- An `Environment` step printing `python -VV`, `uname -a` and `pip freeze`, so
+  a future red run is diagnosable from its own log rather than by reproducing
+  it by hand.
+- A separate `pytest --collect-only -q` step. `ruff` and `mypy` never import
+  the package, so an import error can only surface at collection; giving it its
+  own step stops "the suite could not load" and "a test failed" from rendering
+  as the same red X.
+- Every action pinned to a commit SHA with its version in a comment, and
+  upgraded off the deprecated Node 20 runtimes (`checkout` v7, `setup-python`
+  v7, `upload-artifact` v7, `download-artifact` v8).
+
+### The part worth remembering
+
+A green local suite and a red CI suite are not a contradiction to be explained
+away; they are two different environments disagreeing, and the disagreement is
+the information. The gap here was one word -- `-m` -- and it hid the fact that
+no test had executed in CI for two months.
