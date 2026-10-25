@@ -370,7 +370,7 @@ At minimum, make sure the notes answer: why one EC2 instance and not ECS/EKS ($0
 
 | Milestone | Status | Notes |
 |---|---|---|
-| M0 CI green | **done** | Cause: CI ran `pytest`, Makefile ran `python -m pytest`; only the latter puts the repo root on `sys.path`. Fixed with `pythonpath = ["."]`. Runner and action SHAs pinned. |
+| M0 CI green | **done** | Both jobs green (run 40191532932). Three bugs, one theme — the build assumed a dev machine: CI ran `pytest` vs the Makefile's `python -m pytest` (only the latter puts the repo root on `sys.path`, so collection aborted and **no test had run since 28 Aug**); the Makefile hardcoded `.venv/bin/python`, which CI lacks; the bench printer formatted a `None` lag ratio. Runner and all action SHAs pinned, Node 20 actions upgraded. 357 tests. |
 | M1 Gateway ops refactors | not started | |
 | M2 Console backend | not started | |
 | M3 Console frontend | not started | |
