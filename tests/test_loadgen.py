@@ -358,3 +358,27 @@ async def test_a_gateway_error_frame_is_counted_as_a_failure(fleet_server):
     assert all(r.status == 200 for r in records), "the SSE response itself is well-formed"
     assert all(not r.ok for r in records), "but every request failed and must count as one"
     assert all(r.finish_reason == "provider_error" for r in records)
+
+
+def test_lag_ratio_is_none_when_nothing_completed_in_window():
+    """With no completed requests there is no latency to judge lag against.
+
+    The summary reports None rather than 0.0, because "we could not measure
+    this" and "there was no lag" are different claims. A shared CI runner hits
+    this case, and formatting it as a float crashed the whole baseline
+    benchmark -- so the contract is worth pinning down.
+    """
+    records = []
+    for i in range(5):
+        r = RequestRecord(request_id=f"r{i}", tenant="t", intended_start=0.0,
+                          actual_start=0.0)
+        r.status = 503            # admitted nothing, so nothing completed
+        records.append(r)
+
+    summary = summarize(records)
+    assert summary["scheduling_lag_ratio"] is None
+    assert any("lag" in p for p in summary["generator_problems"])
+
+    # What the benchmark printer has to survive.
+    lag = summary["scheduling_lag_ratio"]
+    assert ("  n/a" if lag is None else f"{lag:.3f}") == "  n/a"

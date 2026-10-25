@@ -157,13 +157,19 @@ async def run(
             write_parquet(outcome.records, f"{out_dir}/baseline_rate{rate:g}.parquet",
                           label=f"baseline_rate{rate:g}", spec=spec)
 
+            # `scheduling_lag_ratio` is None when nothing completed inside the
+            # measurement window, which is the summary honestly reporting
+            # "unknown" rather than a misleading zero. A shared CI runner hits
+            # that case; formatting it as a float crashed the whole benchmark.
+            lag = summary["scheduling_lag_ratio"]
+            lag_text = "  n/a" if lag is None else f"{lag:.3f}"
             print(
                 f"rate={rate:>5g}  n={summary['requests_in_window']:>4}"
                 f"/{summary['requests_total']:<4}  "
                 f"p50={summary['latency_p50_ms']:>7.1f}ms  "
                 f"p99={summary['latency_p99_ms']:>8.1f}ms  "
                 f"ttft_p50={summary['ttft_p50_ms']:>6.1f}ms  "
-                f"lag={summary['scheduling_lag_ratio']:.3f}  "
+                f"lag={lag_text}  "
                 f"peak_conc={summary['peak_concurrency']:>3}  "
                 f"{'ok' if summary['generator_healthy'] else 'GENERATOR UNHEALTHY'}"
             )
