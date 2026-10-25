@@ -31,7 +31,20 @@ COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 # A regular install, not editable: the source is baked in and nothing mounts
 # over it, so an editable install would only add a .pth indirection.
-RUN pip install --no-cache-dir .
+#
+# Then the packaging toolchain is removed. Trivy flagged four fixable HIGH
+# advisories in this image and every one of them was in tooling, not in
+# Switchyard's dependencies: setuptools (CVE-2025-47273) plus urllib3 and
+# msgpack vendored inside pip itself. A service that runs `uvicorn` never
+# installs anything, so the honest fix is to delete the installer rather than
+# chase its version -- it removes the vulnerable code instead of upgrading it,
+# and it shrinks the runtime image.
+#
+# Order matters: setuptools first, then pip, because pip is doing the
+# uninstalling.
+RUN pip install --no-cache-dir . \
+    && pip uninstall --yes setuptools wheel \
+    && pip uninstall --yes pip
 
 # Default home for the budget state file. A volume mounts here, so spend
 # survives `docker compose restart` and image rebuilds.
