@@ -170,3 +170,62 @@ async def tenant_gateway(fleet_server: RunningServer) -> AsyncIterator[TenantGat
     finally:
         server.should_exit = True
         await asyncio.wait_for(task, timeout=5)
+
+
+class RunningConsole:
+    """The console app on a real socket, pointed at wherever it was told."""
+
+    def __init__(self, base_url: str, settings) -> None:
+        self.base_url = base_url
+        self.settings = settings
+
+
+CONSOLE_PASSWORD = "demo-password"
+CONSOLE_SECRET = "test-session-secret"
+
+
+def console_settings(**over):
+    """Settings for a console whose gateway and fleet are unreachable.
+
+    Port 1 is closed, so the collector marks both services down. That is the
+    interesting default: a console is most needed when what it watches is
+    broken, and it must come up anyway.
+    """
+    from switchyard.console.settings import Settings
+
+    base = {
+        "gateway_url": "http://127.0.0.1:1",
+        "fleet_url": "http://127.0.0.1:1",
+        "password": CONSOLE_PASSWORD,
+        "session_secret": CONSOLE_SECRET,
+        "demo_keys": {"acme": "sk_sy_acme_test"},
+        "poll_interval_s": 0.05,
+    }
+    return Settings(**(base | over))
+
+
+@pytest_asyncio.fixture
+async def console() -> AsyncIterator[RunningConsole]:
+    from switchyard.console.app import create_app as create_console
+
+    settings = console_settings()
+    server, task, port = await _serve(create_console(settings))
+    try:
+        yield RunningConsole(f"http://127.0.0.1:{port}", settings)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=10)
+
+
+@pytest_asyncio.fixture
+async def readonly_console() -> AsyncIterator[RunningConsole]:
+    """Section 9: CONSOLE_DEMO_CONTROLS=false, as a company running live would."""
+    from switchyard.console.app import create_app as create_console
+
+    settings = console_settings(demo_controls=False)
+    server, task, port = await _serve(create_console(settings))
+    try:
+        yield RunningConsole(f"http://127.0.0.1:{port}", settings)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=10)

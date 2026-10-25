@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Switchyard Console</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#9654;</text></svg>">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="chrome">
+  <div class="mode" id="mode-banner" data-mode="simulation">
+    <span class="mode-tag" id="mode-tag">SIMULATION</span>
+    <span class="mode-text" id="mode-text">synthetic providers · no real LLM calls · $0</span>
+    <a class="mode-link" href="#/system">How to connect real providers</a>
+  </div>
+
+  <div class="kpis" id="kpis" aria-label="Live totals">
+    <div class="kpi"><span class="kpi-value" id="kpi-rps">–</span><span class="kpi-label">requests/s</span></div>
+    <div class="kpi"><span class="kpi-value" id="kpi-success">–</span><span class="kpi-label">success 60s</span></div>
+    <div class="kpi"><span class="kpi-value" id="kpi-failovers">–</span><span class="kpi-label">failovers 5m</span></div>
+    <div class="kpi"><span class="kpi-value" id="kpi-capacity">–</span><span class="kpi-label">capacity in use</span></div>
+    <div class="kpi kpi-build"><span class="kpi-value" id="kpi-build">–</span><span class="kpi-label">version</span></div>
+    <div class="kpi kpi-conn">
+      <span class="conn" id="conn" data-state="connecting"><span class="dot" aria-hidden="true"></span><span id="conn-text">connecting</span></span>
+    </div>
+  </div>
+
+  <nav class="tabs" aria-label="Sections">
+    <a href="#/" data-route="/">Live map</a>
+    <a href="#/tenants" data-route="/tenants">Tenants</a>
+    <a href="#/providers" data-route="/providers">Providers</a>
+    <a href="#/demo" data-route="/demo">Demo</a>
+    <a href="#/system" data-route="/system">System</a>
+    <a href="#/api" data-route="/api">API</a>
+  </nav>
+</header>
+
+<main id="main">
+  <!-- Live map -->
+  <section class="page" id="page-map" hidden>
+    <div class="map-wrap">
+      <svg id="map" viewBox="0 0 1000 560" role="img"
+           aria-label="Live system map: tenants, gateway capacity, and providers">
+        <title>Live system map</title>
+        <g id="map-flows"></g>
+        <g id="map-tenants"></g>
+        <g id="map-gateway"></g>
+        <g id="map-providers"></g>
+      </svg>
+    </div>
+    <p class="legend" id="map-legend">
+      Dots show measured rates, sampled once a second — each dot stands for
+      roughly one request per second, not an individual request.
+    </p>
+    <h2 class="section-h">What just happened</h2>
+    <ol class="events" id="events" aria-live="polite"></ol>
+  </section>
+
+  <!-- Tenants -->
+  <section class="page" id="page-tenants" hidden>
+    <h2 class="section-h">Tenants</h2>
+    <div class="table-wrap"><table id="tenants-table">
+      <caption>Per-tenant capacity, throughput and budget. Queue wait is a p95
+        approximated from histogram buckets.</caption>
+      <thead><tr>
+        <th scope="col">Tenant</th><th scope="col">Weight</th><th scope="col">Floor</th>
+        <th scope="col">Ceiling</th><th scope="col">In flight</th><th scope="col">Queued</th>
+        <th scope="col">Offered /s</th><th scope="col">Served /s</th><th scope="col">Refused /s</th>
+        <th scope="col">Queue wait p95</th><th scope="col">Tokens/s</th><th scope="col">Budget</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <!-- Providers -->
+  <section class="page" id="page-providers" hidden>
+    <h2 class="section-h">Providers</h2>
+    <div class="table-wrap"><table id="providers-table">
+      <caption>Breaker state, observed latency and injected faults.</caption>
+      <thead><tr>
+        <th scope="col">Provider</th><th scope="col">Kind</th><th scope="col">Breaker</th>
+        <th scope="col">TTFT</th><th scope="col">OK /s</th><th scope="col">Failed /s</th>
+        <th scope="col">Serving</th><th scope="col">Injected fault</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <h3 class="section-h">Breaker state, last 10 minutes</h3>
+    <div id="breaker-timeline" class="timeline"></div>
+  </section>
+
+  <!-- Demo -->
+  <section class="page" id="page-demo" hidden>
+    <h2 class="section-h">Guided demos</h2>
+    <div id="demo-locked" class="card">
+      <p>The demo controls generate load and break providers on purpose, so
+         they need the console password.</p>
+      <form id="login-form" class="login">
+        <label for="password">Console password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+      </form>
+      <p class="error" id="login-error" role="alert" hidden></p>
+    </div>
+
+    <div id="demo-unlocked" hidden>
+      <div class="demo-grid" id="demo-buttons"></div>
+      <div class="card" id="scenario-card" hidden>
+        <h3 id="scenario-name"></h3>
+        <p id="scenario-headline" class="muted"></p>
+        <p><strong>Phase:</strong> <span id="scenario-phase"></span>
+           <span id="scenario-elapsed" class="muted"></span></p>
+        <ol class="checks" id="scenario-checks"></ol>
+        <p id="scenario-summary" class="summary"></p>
+      </div>
+      <h3 class="section-h">Break a provider by hand</h3>
+      <div class="demo-grid" id="fault-buttons"></div>
+    </div>
+    <p id="demo-disabled" class="card" hidden>
+      Demo controls are disabled on this deployment
+      (<code>CONSOLE_DEMO_CONTROLS=false</code>). This is what a company running
+      real providers would do: the gateway keeps working, but nothing here can
+      generate traffic or inject faults.
+    </p>
+  </section>
+
+  <!-- System -->
+  <section class="page" id="page-system" hidden>
+    <h2 class="section-h">System</h2>
+    <div class="tiles" id="service-tiles"></div>
+    <h3 class="section-h">Build</h3>
+    <dl class="facts" id="build-facts"></dl>
+    <h3 class="section-h">How to connect real providers</h3>
+    <div class="card">
+      <p>Nothing here is hard-wired to the synthetic fleet. Point a provider at
+         a real OpenAI-compatible endpoint and the same image, pipeline and
+         dashboards keep working — the banner above switches to
+         <strong>LIVE PROVIDERS</strong> on its own, because it is derived from
+         configuration rather than a flag.</p>
+      <pre><code id="real-provider-snippet"></code></pre>
+      <p>Then set <code>CONSOLE_DEMO_CONTROLS=false</code> so this console
+         serves read-only. Full notes in <code>docs/production.md</code>.</p>
+    </div>
+  </section>
+
+  <!-- API -->
+  <section class="page" id="page-api" hidden>
+    <h2 class="section-h">Calling the gateway</h2>
+    <div class="card">
+      <p>OpenAI-compatible, so existing SDKs work by changing the base URL.</p>
+      <pre><code id="curl-snippet"></code></pre>
+      <pre><code id="sdk-snippet"></code></pre>
+    </div>
+    <h3 class="section-h">Endpoints</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th scope="col">Endpoint</th><th scope="col">Auth</th><th scope="col">Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /v1/chat/completions</code></td><td>tenant</td><td>Streaming and non-streaming completions</td></tr>
+        <tr><td><code>GET /livez</code></td><td>none</td><td>Liveness — 200 even while draining</td></tr>
+        <tr><td><code>GET /readyz</code></td><td>none</td><td>Readiness — 503 while draining, carries the build SHA</td></tr>
+        <tr><td><code>GET /metrics</code></td><td>admin</td><td>Prometheus exposition</td></tr>
+        <tr><td><code>GET /v1/scheduler/stats</code></td><td>admin</td><td>Queues, capacity, per-tenant budgets</td></tr>
+        <tr><td><code>GET /v1/providers</code></td><td>admin</td><td>Provider health and breaker state</td></tr>
+        <tr><td><code>POST /v1/admin/drain</code></td><td>admin</td><td>Refuse queued work, let running work finish</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span id="foot-note">Switchyard</span>
+  <span id="foot-links"></span>
+</footer>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -827,3 +827,75 @@ That is a real weakness, recorded rather than hidden -- anyone on the path can
 read the cookie and drive the demo controls. It guards buttons that generate
 synthetic load against a synthetic fleet, which is the only reason it is
 tolerable. HTTPS is the first thing to buy.
+
+## M3 -- the live map
+
+### No framework, and what that bought
+
+Three files the browser loads directly: an HTML shell, a stylesheet, and two
+ES modules. No bundler, no dependency tree, no build step between the source
+and what runs. For a UI this size that is not asceticism -- it is one fewer
+toolchain to install, pin, audit and explain, and the thing deployed is the
+thing in the repository.
+
+The cost is manual DOM work. The benefit showed up immediately in the CSP: the
+page loads nothing from anywhere else, so the policy can be
+`default-src 'self'` with no `unsafe-inline`, and a test asserts the page has
+no inline styles, no inline scripts and no event-handler attributes. Those are
+invisible failures otherwise -- a browser silently refuses to apply the style
+and the page simply looks wrong.
+
+### A particle is not a request
+
+Dots travel tenant to gateway to provider at a rate proportional to measured
+throughput. One dot is roughly one request per second, not one request. At 25
+rps the honest version would be unreadable and at 300 it would be a solid bar,
+so the map draws a rate and the legend says exactly that. Animating one dot
+per request would be a more impressive lie.
+
+Motion is decoration throughout: every number the particles encode is also
+present as text, which is why `prefers-reduced-motion` can switch the flow
+layer off and lose nothing. Rendering is capped at 30fps and pauses when the
+tab is hidden, because this shares a CPU with the gateway it is measuring.
+
+### Capacity drawn as slots, not a percentage
+
+The gateway panel draws `max_concurrency` individual squares, each outlined in
+the colour of the tenant whose reserved floor owns it, dashed where it belongs
+to the shared pool, and filled when occupied. A utilisation bar would say
+"58%"; the grid shows *whose* 58% and which slots nobody else can take. That
+is the difference between a number and an explanation, and the floor stops
+being a line in a config file.
+
+### Three bugs that only running it could find
+
+1. **Signing in worked, then undid itself a second later.** `EventSource` was
+   opened before the session cookie existed, so every snapshot on that stream
+   reported `authenticated: false` and overwrote the local flag. The fix is to
+   reconnect the stream after login; the stream is also now trusted to grant
+   access and never to revoke it mid-connection.
+2. **Buttons were rebuilt sixty times a minute.** Every snapshot replaced the
+   whole control panel, so a click could land on a node that had just been
+   swapped out -- which is exactly what happened while testing. They are now
+   rebuilt only when their own state changes.
+3. **Two strings shared one baseline.** At 420px the tenant card's served and
+   queued lines fit side by side; at 236px -- the width that actually ships --
+   they overlapped. Fixed by giving each its own line, which is also what the
+   phone layout wanted.
+
+None of these would have been caught by the API tests, because all three live
+between a browser and a server that were each behaving correctly.
+
+### A check that reported FAIL when it meant "no evidence"
+
+The noisy-neighbour demo scored its third check -- that refusals land on the
+tenant causing them -- as a failure, with the detail "the flood never exceeded
+capacity". That detail was true and the verdict was wrong: with 24 slots and a
+256-deep queue, acme's flood queued instead of being refused, which is the
+gateway working. There were no refusals to attribute.
+
+It now distinguishes three cases: the quiet tenant being refused is a genuine
+FAIL, only the noisy tenant being refused is a PASS, and nothing refused
+anywhere leaves the check pending with what to change to exercise that path.
+Marking a correctly-behaving gateway broken is the worse error, and a demo
+that cries wolf teaches its audience to stop reading the verdicts.

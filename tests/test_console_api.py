@@ -8,11 +8,12 @@ side-effecting surface cannot be driven without a session.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 
 import httpx
 import pytest
-import pytest_asyncio
+from tests.conftest import CONSOLE_PASSWORD as PASSWORD
+from tests.conftest import CONSOLE_SECRET as SECRET
+from tests.conftest import RunningConsole
 
 from switchyard.console import auth
 from switchyard.console.app import create_app as create_console
@@ -24,40 +25,6 @@ from switchyard.console.traffic import (
     PROFILES,
     Profile,
 )
-
-PASSWORD = "demo-password"
-SECRET = "test-session-secret"
-
-
-class RunningConsole:
-    def __init__(self, base_url: str, settings: Settings) -> None:
-        self.base_url = base_url
-        self.settings = settings
-
-
-def console_settings(**over) -> Settings:
-    base = {
-        "gateway_url": "http://127.0.0.1:1",      # closed port: gateway "down"
-        "fleet_url": "http://127.0.0.1:1",
-        "password": PASSWORD,
-        "session_secret": SECRET,
-        "demo_keys": {"acme": "sk_sy_acme_test"},
-        "poll_interval_s": 0.05,
-    }
-    return Settings(**(base | over))
-
-
-@pytest_asyncio.fixture
-async def console() -> AsyncIterator[RunningConsole]:
-    from tests.conftest import _serve
-
-    settings = console_settings()
-    server, task, port = await _serve(create_console(settings))
-    try:
-        yield RunningConsole(f"http://127.0.0.1:{port}", settings)
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(task, timeout=10)
 
 
 async def client_for(c: RunningConsole) -> httpx.AsyncClient:
@@ -210,20 +177,6 @@ async def test_login_is_rate_limited(console):
 
 
 # -- controls disabled for a real-provider deployment ----------------------
-
-
-@pytest_asyncio.fixture
-async def readonly_console() -> AsyncIterator[RunningConsole]:
-    """Section 9: CONSOLE_DEMO_CONTROLS=false for a company running live."""
-    from tests.conftest import _serve
-
-    settings = console_settings(demo_controls=False)
-    server, task, port = await _serve(create_console(settings))
-    try:
-        yield RunningConsole(f"http://127.0.0.1:{port}", settings)
-    finally:
-        server.should_exit = True
-        await asyncio.wait_for(task, timeout=10)
 
 
 @pytest.mark.parametrize("path,body", WRITES)

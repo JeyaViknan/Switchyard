@@ -223,12 +223,28 @@ class ScenarioRunner:
 
         noisy_rejected = _sum_over(flood, NOISY_TENANT, "rejected_rps")
         quiet_rejected = _sum_over(flood, QUIET_TENANT, "rejected_rps")
-        by_name["rejections_land_on_the_cause"].decide(
-            noisy_rejected > 0 and quiet_rejected == 0,
-            f"'{NOISY_TENANT}' turned away {noisy_rejected:.0f} req/s-samples, "
-            f"'{QUIET_TENANT}' {quiet_rejected:.0f}"
-            + ("" if noisy_rejected else " -- the flood never exceeded capacity"),
-        )
+        check = by_name["rejections_land_on_the_cause"]
+        if quiet_rejected > 0:
+            # The failure this check exists to catch: the protected tenant is
+            # the one being turned away.
+            check.decide(False,
+                         f"'{QUIET_TENANT}' was turned away during the flood, "
+                         f"which is the tenant the floor is supposed to protect")
+        elif noisy_rejected > 0:
+            check.decide(True,
+                         f"only '{NOISY_TENANT}' was turned away; "
+                         f"'{QUIET_TENANT}' was never refused")
+        else:
+            # Nothing was rejected at all, so there is no evidence either way.
+            # Reporting FAIL here would mark a correctly-behaving gateway as
+            # broken: with enough capacity the flood queues instead of being
+            # refused, which is the system working, not the claim failing.
+            check.status = PENDING
+            check.detail = (
+                "no requests were refused -- the flood fit inside capacity, so "
+                "there was nothing to attribute. Lower gateway.max_concurrency "
+                "or the tenant's max_queue_depth to force the refusal path."
+            )
         _ = baseline      # kept for the UI's before/after, not scored
 
     # ------------------------------------------------------ provider outage

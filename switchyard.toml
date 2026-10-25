@@ -73,6 +73,7 @@ half_open_probes = 2
 # A large tenant with a guaranteed floor and most of the contended share.
 [[tenants]]
 id = "acme"
+#   sk_sy_acme_b6525e6c60405226fc726bdda422dd2f
 key_sha256 = "f7b33cfa621ab5b927dea4a0f641357da8cc1c8149003a54523a4ec43270dd0b"
 weight = 3.0
 reserved_concurrency = 6
@@ -84,7 +85,8 @@ deadline_s = 30.0
 # A smaller tenant. Its floor is what protects it from acme.
 [[tenants]]
 id = "globex"
-key_sha256 = "bef8856b7bd67fde08d3b2f960fb92e806782d3680ee2c649fa4026862a2381e"
+#   sk_sy_globex_834d97c4fbd22ebe7a67696345b8693f
+key_sha256 = "6abebed6a12d92f1d3f0811b8770651f86d9f9c807358ee2ff4fd6df544ebbc9"
 weight = 1.0
 reserved_concurrency = 4
 max_concurrency = 12
@@ -94,7 +96,8 @@ deadline_s = 30.0
 # A tenant on a tight budget, for exercising budget exhaustion.
 [[tenants]]
 id = "initech"
-key_sha256 = "a97c099ed7381510e0f2f27169efe90fcc8eb8fa58b3f3b8d8eb9201019100c5"
+#   sk_sy_initech_64b4a01257ee3b9d7b2caf98079f8886
+key_sha256 = "182a8c09551048ffc596a983bfe5d3f5c9799a9660e3a1dab28146159fed793a"
 weight = 1.0
 reserved_concurrency = 2
 max_concurrency = 8

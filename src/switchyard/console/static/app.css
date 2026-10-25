@@ -1,0 +1,276 @@
+/* Switchyard console.
+   Mobile-first: the demo happens on a phone in portrait, so the narrow layout
+   is the default and the wide one is the override.
+   Status is never carried by colour alone -- every state has an icon and a
+   word beside it, because a red dot means nothing to a colour-blind viewer
+   or on a projector that has eaten the contrast. */
+
+:root {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --ink: #15181d;
+  --muted: #5b6472;
+  --line: #d9dee6;
+  --accent: #2b5fd9;
+
+  --ok: #1a7f4b;
+  --warn: #9a6400;
+  --bad: #b3261e;
+  --ok-bg: #e6f4ec;
+  --warn-bg: #fdf3e0;
+  --bad-bg: #fbeae9;
+
+  /* Tenant identity. Chosen to stay distinguishable in both themes and under
+     the common forms of colour blindness; the map also labels every lane. */
+  --t0: #2b5fd9;
+  --t1: #0f8a7e;
+  --t2: #8a5cd6;
+  --t3: #b86a00;
+
+  --radius: 10px;
+  --gap: 12px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --panel: #171b21;
+    --ink: #e8ecf2;
+    --muted: #9aa5b4;
+    --line: #2a313a;
+    --accent: #6f9bff;
+    --ok: #4ad295;
+    --warn: #f0b64a;
+    --bad: #ff6b60;
+    --ok-bg: #11291f;
+    --warn-bg: #2b2213;
+    --bad-bg: #2e1715;
+    --t0: #6f9bff;
+    --t1: #35c9b6;
+    --t2: #b48bff;
+    --t3: #f0a64a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+
+.skip {
+  position: absolute; left: -9999px;
+}
+.skip:focus {
+  left: 8px; top: 8px; z-index: 10;
+  background: var(--panel); padding: 8px 12px; border-radius: var(--radius);
+}
+
+/* ---------------------------------------------------------------- chrome */
+
+.chrome {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  padding: 8px 16px 0;
+}
+
+.mode {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 7px 10px; border-radius: var(--radius);
+  background: var(--ok-bg); border: 1px solid var(--ok);
+  font-size: 13px;
+}
+.mode[data-mode="live-providers"] {
+  background: var(--warn-bg); border-color: var(--warn);
+}
+.mode-tag {
+  font: 600 11px/1 var(--mono); letter-spacing: .09em;
+  padding: 4px 7px; border-radius: 5px;
+  background: var(--ok); color: var(--bg);
+}
+.mode[data-mode="live-providers"] .mode-tag { background: var(--warn); }
+.mode-text { color: var(--muted); }
+.mode-link { margin-left: auto; color: var(--accent); }
+
+.kpis {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 6px; margin: 10px 0;
+}
+.kpi {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 7px 9px; min-width: 0;
+}
+.kpi-value {
+  display: block; font: 600 17px/1.2 var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kpi-label { display: block; font-size: 11px; color: var(--muted); }
+.kpi-conn { display: flex; align-items: center; }
+
+.conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--muted); flex: none;
+}
+.conn[data-state="live"] .dot { background: var(--ok); }
+.conn[data-state="connecting"] .dot { background: var(--warn); }
+.conn[data-state="down"] .dot { background: var(--bad); }
+
+.tabs {
+  display: flex; gap: 4px; overflow-x: auto;
+  scrollbar-width: none; padding-bottom: 2px;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tabs a {
+  padding: 8px 11px; border-radius: 8px 8px 0 0;
+  color: var(--muted); text-decoration: none; white-space: nowrap;
+  font-size: 14px; border: 1px solid transparent; border-bottom: none;
+}
+.tabs a[aria-current="page"] {
+  background: var(--panel); color: var(--ink);
+  border-color: var(--line); font-weight: 600;
+}
+
+/* ----------------------------------------------------------------- pages */
+
+main { padding: 14px 16px 40px; max-width: 1180px; margin: 0 auto; }
+.section-h { font-size: 15px; margin: 20px 0 8px; }
+.muted { color: var(--muted); }
+
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px; margin-bottom: 12px;
+}
+
+.map-wrap {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 6px; overflow: hidden;
+}
+#map { width: 100%; height: auto; display: block; }
+.legend { color: var(--muted); font-size: 12px; margin: 8px 2px 0; }
+
+/* Table that becomes a stack of labelled rows on a phone. */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); }
+caption {
+  text-align: left; color: var(--muted); font-size: 12px;
+  padding: 8px 10px; caption-side: top;
+}
+th, td {
+  text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+  font-size: 13px; white-space: nowrap;
+}
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.num, th.num { text-align: right; font-family: var(--mono); }
+
+.events { list-style: none; margin: 0; padding: 0; }
+.events li {
+  display: flex; gap: 9px; align-items: baseline;
+  background: var(--panel); border: 1px solid var(--line);
+  border-left-width: 3px; border-radius: 7px;
+  padding: 8px 10px; margin-bottom: 5px; font-size: 13px;
+}
+.events li[data-severity="warning"] { border-left-color: var(--warn); }
+.events li[data-severity="critical"] { border-left-color: var(--bad); }
+.events li[data-severity="info"] { border-left-color: var(--accent); }
+.events time { color: var(--muted); font: 11px/1.6 var(--mono); flex: none; }
+.ev-icon { flex: none; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px; border-radius: 999px;
+  font-size: 11.5px; border: 1px solid var(--line);
+}
+.badge[data-state="closed"] { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+.badge[data-state="half_open"] { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+.badge[data-state="open"] { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); }
+.badge[data-kind="external"] { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+
+.demo-grid { display: grid; gap: 10px; grid-template-columns: 1fr; }
+.demo-btn {
+  text-align: left; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 12px 14px; cursor: pointer; font: inherit;
+}
+.demo-btn:hover:not(:disabled) { border-color: var(--accent); }
+.demo-btn:disabled { opacity: .55; cursor: not-allowed; }
+.demo-btn strong { display: block; font-size: 15px; margin-bottom: 3px; }
+.demo-btn span { color: var(--muted); font-size: 12.5px; }
+.demo-btn.danger { border-color: var(--bad); }
+
+.checks { list-style: none; margin: 10px 0 0; padding: 0; }
+.checks li {
+  display: flex; gap: 9px; align-items: baseline;
+  padding: 7px 0; border-top: 1px solid var(--line); font-size: 13.5px;
+}
+.checks li[data-status="pass"] .check-icon { color: var(--ok); }
+.checks li[data-status="fail"] .check-icon { color: var(--bad); }
+.checks li[data-status="pending"] .check-icon { color: var(--muted); }
+.check-detail { color: var(--muted); font-size: 12px; display: block; }
+.summary { font-weight: 600; margin: 12px 0 0; }
+
+.login { display: grid; gap: 8px; max-width: 320px; }
+.login input, .login button {
+  font: inherit; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+}
+.login button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+.error { color: var(--bad); }
+
+.tiles { display: grid; gap: 10px; grid-template-columns: repeat(2, 1fr); }
+.tile {
+  background: var(--panel); border: 1px solid var(--line);
+  border-left-width: 3px; border-radius: var(--radius); padding: 11px;
+}
+.tile[data-state="up"], .tile[data-state="ready"] { border-left-color: var(--ok); }
+.tile[data-state="down"] { border-left-color: var(--bad); }
+.tile[data-state="draining"] { border-left-color: var(--warn); }
+.tile-name { font-size: 12px; color: var(--muted); }
+.tile-state { font-weight: 600; }
+
+.facts { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; }
+.facts dt { color: var(--muted); font-size: 13px; }
+.facts dd { margin: 0; font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+
+.timeline { display: grid; gap: 8px; }
+.timeline-row { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
+.timeline-name { font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+.timeline-bar { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--line); }
+.timeline-seg { height: 100%; }
+
+pre {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 11px; overflow-x: auto; margin: 10px 0 0;
+}
+code { font-family: var(--mono); font-size: 12.5px; }
+
+.foot {
+  display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between;
+  padding: 14px 16px 26px; color: var(--muted); font-size: 12px;
+  max-width: 1180px; margin: 0 auto;
+}
+.foot a { color: var(--accent); }
+
+/* ------------------------------------------------------------ wider than a phone */
+
+@media (min-width: 720px) {
+  .kpis { grid-template-columns: repeat(6, 1fr); }
+  .demo-grid { grid-template-columns: repeat(2, 1fr); }
+  .tiles { grid-template-columns: repeat(4, 1fr); }
+  main { padding: 18px 24px 48px; }
+  .chrome { padding: 10px 24px 0; }
+}
+
+/* Motion is decoration here: every number is in the DOM as text, so turning
+   the particles off costs nothing but the animation. */
+@media (prefers-reduced-motion: reduce) {
+  #map-flows { display: none; }
+  * { animation: none !important; transition: none !important; }
+}
