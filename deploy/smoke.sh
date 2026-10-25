@@ -10,8 +10,11 @@ set -euo pipefail
 
 EXPECTED_SHA="${1:-}"
 BASE="${2:-http://localhost}"
-API="${BASE}:8000"
-CONSOLE="${BASE}"
+API="${SMOKE_API_URL:-${BASE}:8000}"
+# The production stack publishes the console on :80; the development stack
+# (docker-compose.yml) uses :8080. Overridable so one script can smoke both
+# rather than quietly only ever being correct about one of them.
+CONSOLE="${SMOKE_CONSOLE_URL:-${BASE}}"
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok  $*"; }
 
@@ -43,12 +46,22 @@ if [ -n "${KEY}" ]; then
           -H "Authorization: Bearer ${KEY}" -H 'Content-Type: application/json' \
           -d "${BODY}") || fail "completion request failed"
   printf '%s' "${OUT}" | grep -q 'data:' || fail "no SSE frames in the response"
-  # A typed error frame is still a 200, so check how the stream ended rather
-  # than trusting the status code -- the load generator made this exact
-  # mistake once and reported a total outage as 370 successes.
-  printf '%s' "${OUT}" | grep -q '"finish_reason":"stop"' \
-    || fail "stream did not finish cleanly: $(printf '%s' "${OUT}" | tail -c 200)"
-  ok "completion streamed and finished cleanly"
+
+  # A typed error frame is still delivered under a 200, so check how the
+  # stream *ended* rather than trusting the status code -- the load generator
+  # made that exact mistake once and scored a total outage as 370 successes.
+  #
+  # Two finish reasons are clean. "stop" is the model deciding it is done;
+  # "length" is it hitting max_tokens, which is what a 16-token smoke request
+  # should produce and is equally a successful completion. Anything else --
+  # provider_error, truncated -- is a failure, and so is no terminal frame.
+  REASON=$(printf '%s' "${OUT}" \
+    | grep -o '"finish_reason":"[a-z_]*"' | tail -1 | cut -d'"' -f4)
+  case "${REASON}" in
+    stop|length) ok "completion streamed and finished cleanly (${REASON})" ;;
+    "")          fail "stream carried no terminal frame: $(printf '%s' "${OUT}" | tail -c 160)" ;;
+    *)           fail "stream ended with finish_reason='${REASON}'" ;;
+  esac
 else
   echo "  --  skipping completion: set SMOKE_TENANT_KEY to exercise it"
 fi
