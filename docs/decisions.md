@@ -609,6 +609,20 @@ passed.
   upgraded off the deprecated Node 20 runtimes (`checkout` v7, `setup-python`
   v7, `upload-artifact` v7, `download-artifact` v8).
 
+### The same mistake, a second time
+
+Fixing the test job let the `bench` job run for the first time, and it failed
+immediately: `make: .venv/bin/python: No such file or directory`. The Makefile
+hardcoded `PY := $(VENV)/bin/python`, but CI installs with `pip install -e .`
+into the runner's own Python and has no virtualenv. Because that job only runs
+on manual dispatch, nobody had ever seen it.
+
+It is the same defect as the pytest one wearing different clothes: the build
+assumed a developer's machine. `PY` and the tool paths now fall back to what is
+on `PATH` when `.venv/bin/python` is absent, so the targets work in both
+places. `install` keeps the explicit venv path, because the conditional is
+evaluated when the Makefile is parsed -- before the venv it creates exists.
+
 ### The part worth remembering
 
 A green local suite and a red CI suite are not a contradiction to be explained

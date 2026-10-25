@@ -1,5 +1,19 @@
-VENV   := .venv
-PY     := $(VENV)/bin/python
+VENV    := .venv
+VENV_PY := $(VENV)/bin/python
+
+# Prefer the project venv when it exists, which is the normal local setup.
+# Fall back to whatever is on PATH: CI runs `pip install -e .` into the
+# runner's own Python and has no .venv, and every target here has to work in
+# both places. The bench job failed with "No such file or directory" for two
+# months because this was hardcoded -- the same mistake as the test job
+# depending on how pytest happened to be launched.
+ifneq ($(wildcard $(VENV_PY)),)
+  BIN := $(VENV)/bin/
+  PY  := $(VENV_PY)
+else
+  BIN :=
+  PY  := python3
+endif
 # Any interpreter meeting the project's >=3.12 floor. Override if `python3` is
 # not the one you want: `make install PYTHON=python3.13`.
 PYTHON ?= python3
@@ -12,14 +26,14 @@ install:
 	  || { echo "Switchyard needs Python >= 3.12; $(PYTHON) is $$($(PYTHON) -V 2>&1)."; \
 	       echo "Try: make install PYTHON=python3.13"; exit 1; }
 	$(PYTHON) -m venv $(VENV)
-	$(PY) -m pip install -q --upgrade pip
-	$(PY) -m pip install -q -e ".[dev,bench]"
+	$(VENV_PY) -m pip install -q --upgrade pip
+	$(VENV_PY) -m pip install -q -e ".[dev,bench]"
 
 lint:
-	$(VENV)/bin/ruff check src tests
+	$(BIN)ruff check src tests
 
 typecheck:
-	$(VENV)/bin/mypy src/switchyard/core src/switchyard/adapters src/switchyard/types.py
+	$(BIN)mypy src/switchyard/core src/switchyard/adapters src/switchyard/types.py
 
 test:
 	$(PY) -m pytest -q
