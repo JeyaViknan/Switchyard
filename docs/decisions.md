@@ -899,3 +899,73 @@ FAIL, only the noisy tenant being refused is a PASS, and nothing refused
 anywhere leaves the check pending with what to change to exercise that path.
 Marking a correctly-behaving gateway broken is the worse error, and a demo
 that cries wolf teaches its audience to stop reading the verdicts.
+
+## M5 -- build, scan, smoke, publish
+
+### What the pipeline now refuses to let through
+
+Four jobs. `check` runs the tests and both configurations through
+`switchyard check`. `image` builds with buildx and the GHA cache and scans
+with Trivy. `smoke` brings up the production compose stack, drives a real
+completion, and confirms the sha answering is the sha built. `publish` runs
+only for a commit on `main` that has passed all three.
+
+The ordering is the argument: an image becomes pullable only after something
+has actually served a request with it. A pipeline that publishes on a green
+unit-test run is asserting that the tests cover packaging, networking and
+startup, which they do not.
+
+### Why the scan fails only on fixable findings
+
+`ignore-unfixed: true`. A CVE with no patch available is information, not a
+reason to block every merge until upstream ships -- and a gate that cannot be
+satisfied is one people learn to route around with `--no-verify` or a
+disabled step. Failing on what can be acted on keeps the gate credible.
+
+It found four HIGH advisories on its first run, and every one was in tooling
+rather than in Switchyard's dependencies: `setuptools` (CVE-2025-47273), plus
+`urllib3` and `msgpack` vendored inside `pip` itself.
+
+The fix was to delete the installer rather than upgrade it. A service whose
+job is to run `uvicorn` never installs anything, so removing pip, setuptools
+and wheel after the install removes the vulnerable code instead of moving it
+to a newer version, and takes one executable thing out of the runtime image.
+Verified afterwards that all three entrypoints still import and the stack
+still serves.
+
+### Rebuilding is cheaper than moving the image
+
+`smoke` rebuilds from the GHA cache rather than receiving the image from
+`image` through the artifact store. The cached rebuild is seconds; shipping a
+200 MB tarball out and back is minutes. The jobs stay separate -- so a red X
+still says which stage failed -- without paying for the separation.
+
+### Two bugs in the smoke test itself
+
+The first run failed on a completion that had worked perfectly. The script
+asserted `finish_reason: "stop"`, and the request asks for 16 tokens, gets
+16, and ends `"length"`. That is a successful completion.
+
+It is the load generator's old bug from the other side: that one scored typed
+error frames as successes, this one scored a legitimate finish as a failure.
+Both are reading the wrong field. The check now names the terminal reason --
+`stop` and `length` pass, a missing terminal frame fails, and anything else
+fails with the reason printed.
+
+The second: the wait step waited for the gateway and then immediately smoked
+the console. The console has `depends_on: gateway service_healthy`, so it
+only *begins* starting when the gateway reports ready. The port was already
+bound by Docker's proxy, so the failure was a connection reset rather than a
+refusal -- which reads like a crash and was a race.
+
+### release.yml, and the first tag that published nothing
+
+PyPI is now behind the `PUBLISH_PYPI` repository variable, and
+`github-release` depends on `build` and `image` rather than on `pypi`.
+
+On the first `v0.1.0` tag the pypi job failed, because trusted publishing had
+not been configured -- and because the release job depended on it, the
+container image and the release notes were suppressed too. One unconfigured
+optional registry took down two things that had nothing to do with it.
+Optional steps should be optional in the dependency graph, not just in
+intent.

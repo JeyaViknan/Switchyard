@@ -250,11 +250,11 @@ may point at a circuit that has since opened.
 ]
 \node[stage] (commit) {git commit\\\tiny branch \texttt{devops}};
 \node[stage,right=of commit] (pr) {push / PR};
-\node[stage,right=of pr] (check) {\textbf{check}\\\tiny ruff · mypy · 465 tests};
+\node[stage,right=of pr] (check) {\textbf{check}\\\tiny ruff · mypy · 467 tests};
 \node[stage,right=of check] (img) {\textbf{image}\\\tiny buildx + GHA cache};
-\node[later,below=7mm of img] (scan) {Trivy scan\\\tiny fail on fixable HIGH};
-\node[later,left=of scan] (smoke) {smoke\\\tiny stack + completion};
-\node[later,left=of smoke] (pub) {publish\\\tiny GHCR by SHA};
+\node[stage,below=7mm of img] (scan) {\textbf{scan}\\\tiny Trivy, fixable HIGH};
+\node[stage,left=of scan] (smoke) {\textbf{smoke}\\\tiny 5 containers + sha match};
+\node[later,left=of smoke] (pub) {publish\\\tiny GHCR by SHA (main only)};
 \node[later,left=of pub] (deploy) {deploy\\\tiny OIDC + SSM};
 \node[later,below=7mm of deploy] (verify) {\texttt{/readyz} SHA\\\tiny matches?};
 \node[later,right=of verify] (live) {live};
@@ -402,12 +402,13 @@ Console caps & 30\,rps, 120 streams, 120\,s & Enforced in
 \subsection{Not verified — say so plainly}
 
 \begin{itemize}
-\item \textbf{The Docker image has never finished building.} The base layer
-  pulls at $\approx$24\,KB/s on this machine; 20 of 30\,MB after 13 minutes.
-  The digest pin resolves and the build context is 406\,kB, but no container
-  has run. \unver
-\item \textbf{\texttt{make prod-local} has not been run}, so there are no
-  \texttt{docker stats} figures and no decision on memory limits. \unver
+\item \textbf{\texttt{publish} has never run.} It is gated on a push to
+  \texttt{main} and this work is on a branch, so no image exists in GHCR
+  yet. \unver
+\item \textbf{\texttt{make prod-local} has not completed on this laptop} --
+  the pinned Prometheus and Grafana images are still pulling -- so there are
+  no \texttt{docker stats} figures and no decision on memory limits. The same
+  compose files do run green in CI. \unver
 \item \textbf{Nothing is deployed to AWS.} No Terraform, no instance, no
   image in GHCR, no alerts. \plan
 \item No HA, no TLS, budgets are lifetime totals, and the console session
@@ -484,6 +485,13 @@ How do secrets reach the box? &
   blast radius of any one file is one container. GitHub assumes an AWS role by
   OIDC, so there is no stored access key. Nothing secret is in git; key
   \emph{digests} are, and they are useless without the pepper. \\
+Your security scan failed. What did you do? &
+  Four fixable HIGH advisories, all in tooling rather than my dependencies:
+  setuptools, and urllib3 and msgpack vendored inside pip. A service that
+  runs \texttt{uvicorn} never installs anything, so I removed pip,
+  setuptools and wheel from the runtime image -- that deletes the vulnerable
+  code rather than upgrading it. The gate ignores unfixed CVEs, because a
+  gate that cannot be satisfied is one people route around. \\
 Why is breaker-open a warning, not critical? &
   Because failover already protected the user. The page-worthy signal is
   client-visible error rate, which is what actually reached someone. \\
@@ -514,7 +522,7 @@ What would you do with a budget? &
   transparent to clients and no partial response ever spliced.
 \item Diagnosed and fixed a CI pipeline that had been red for \textbf{two
   months}: \texttt{pytest} versus \texttt{python -m pytest} differ in
-  \texttt{sys.path}, so collection aborted and \textbf{zero of 465 tests had
+  \texttt{sys.path}, so collection aborted and \textbf{zero of 467 tests had
   executed} while linting stayed green. Restored the suite, pinned the runner
   and all action SHAs off deprecated Node 20, and added environment capture.
 \item Shipped a zero-dependency web console (four static files, strict CSP
