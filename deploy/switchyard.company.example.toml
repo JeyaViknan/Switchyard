@@ -1,0 +1,85 @@
+# What a company changes to run this for real.
+#
+# The short version: this section, and nothing else. Same image, same
+# pipeline, same dashboards, same console. The console's banner switches from
+# SIMULATION to LIVE PROVIDERS on its own, because it is derived from this
+# configuration rather than from a flag someone has to remember to flip.
+
+[gateway]
+# Size this to what your provider contract actually allows, not to what the
+# gateway can hold open. It is the scarce resource the scheduler allocates.
+max_concurrency = 64
+scheduling_policy = "drr"
+state_file = "/var/lib/switchyard/state.json"
+admin_key_sha256 = "<switchyard keys mint --admin>"
+providers = ["openai", "local"]
+
+# --- the only part that differs from the demo -----------------------------
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+# Read from the environment at request time. Never written to a config file,
+# a log, a metric or the console.
+api_key_env = "OPENAI_API_KEY"
+upstream_model = "gpt-4o-mini"
+
+[providers.local]
+# Anything OpenAI-compatible: vLLM, Ollama, TGI, a second vendor.
+base_url = "http://vllm:8000/v1"
+upstream_model = "llama-3.1-8b-instruct"
+
+[routes]
+# Ordered failover. Before the first token the gateway can switch invisibly,
+# so putting a self-hosted model second turns a vendor outage into higher
+# latency rather than an incident.
+fast = ["openai", "local"]
+slow = ["local"]
+
+# --------------------------------------------------------------------------
+
+[timeouts]
+connect_s = 2.0
+# The lever worth tuning first. A failure before the first token is
+# recoverable invisibly, so a tight deadline here moves failure mass into the
+# window where recovery is transparent.
+ttft_s = 8.0
+inter_token_s = 10.0
+total_s = 300.0
+
+[breaker]
+failure_threshold = 0.5
+min_samples = 10
+cooldown_s = 5.0
+half_open_probes = 2
+
+[[tenants]]
+id = "team-search"
+key_sha256 = "<switchyard keys mint team-search>"
+weight = 3.0
+# Little's law: offered_rate x seconds_per_request. `switchyard verify`
+# measures the seconds and prints the arithmetic against your config.
+reserved_concurrency = 12
+max_concurrency = 40
+budget_tokens = 50_000_000
+deadline_s = 30.0
+
+[[tenants]]
+id = "team-support"
+key_sha256 = "<switchyard keys mint team-support>"
+weight = 1.0
+reserved_concurrency = 6
+max_concurrency = 20
+budget_tokens = 10_000_000
+deadline_s = 30.0
+
+# Also change, outside this file:
+#
+#   - drop the `fleet` service from compose.prod.yml; there is nothing to
+#     simulate once traffic is real
+#   - set CONSOLE_DEMO_CONTROLS=false, so the console serves read-only and
+#     refuses traffic generation and fault injection with a 403
+#   - put OPENAI_API_KEY in SSM alongside the pepper, and add it to the
+#     gateway's env file in deploy/deploy.sh
+#   - with a budget: terminate HTTPS at a load balancer, and move spend out of
+#     the process so a new version starts from current spend rather than the
+#     last flush. See docs/production.md.

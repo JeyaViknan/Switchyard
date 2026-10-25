@@ -19,7 +19,8 @@ endif
 PYTHON ?= python3
 
 .PHONY: install test lint typecheck test-all check bench bench-baseline bench-fairness bench-faults \
-        scenario noisy-neighbour provider-outage verify demo dev up down clean
+        scenario noisy-neighbour provider-outage verify demo dev up down clean \
+        prod-local prod-local-down secrets
 
 install:
 	@$(PYTHON) -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' \
@@ -96,6 +97,33 @@ dev:
 
 up:
 	docker compose up --build -d
+
+# Development credentials for the production compose file, written to
+# deploy/local/ (git-ignored).
+secrets:
+	@./scripts/dev-secrets.sh
+
+# The production stack, on a laptop. Same compose file, same topology, same
+# health checks and drain timing as the instance -- only the image source and
+# the env files differ. This is the rehearsal, and the fallback if AWS or the
+# venue wifi is not there on the day.
+#
+#   console  http://localhost
+#   api      http://localhost:8000
+#   grafana  http://localhost:3000
+PROD_LOCAL_ENV := IMAGE_TAG=switchyard:local SWITCHYARD_ENV_DIR=./local \
+                  SWITCHYARD_CONFIG_FILE=./local/switchyard.toml \
+                  SWITCHYARD_STATE_DIR=./local/state
+PROD_LOCAL := docker compose -f deploy/compose.prod.yml -f deploy/compose.local.yml
+
+prod-local: secrets
+	$(PROD_LOCAL_ENV) $(PROD_LOCAL) up --build -d
+	@echo "waiting for the stack to come up..."
+	@$(PROD_LOCAL_ENV) $(PROD_LOCAL) ps --format 'table {{.Service}}\t{{.Status}}'
+	@SMOKE_TENANT_KEY=sk_sy_acme_b6525e6c60405226fc726bdda422dd2f ./deploy/smoke.sh
+
+prod-local-down:
+	$(PROD_LOCAL_ENV) $(PROD_LOCAL) down -v
 
 down:
 	docker compose down -v

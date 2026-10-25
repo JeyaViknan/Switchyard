@@ -1,0 +1,88 @@
+# Deployed configuration.
+#
+# Digests only. The raw keys live in SSM Parameter Store and are written to
+# root-only env files on the instance at deploy time; a digest is useless
+# without the pepper, which is why this file can sit in git.
+#
+# The digests below are PLACEHOLDERS. Run `scripts/mint-prod-keys.sh`, which
+# writes the raw keys into SSM and prints the digests to paste here. Until
+# then every key fails to authenticate -- which is the right direction to be
+# wrong in, and is why the placeholder is all zeroes rather than something
+# that might accidentally be valid.
+
+[gateway]
+# Sized for a t3.micro running five containers. The gateway can hold far more
+# connections than this; the number is what the box can actually serve without
+# the scheduler's own latency becoming the thing being measured.
+max_concurrency = 12
+scheduling_policy = "drr"
+
+# Spend survives restarts and redeploys. The path is a host bind mount, so it
+# also survives `compose down -v`.
+state_file = "/var/lib/switchyard/state.json"
+state_flush_interval_s = 2.0
+
+# Operational endpoints: /metrics, /v1/providers, /v1/scheduler/stats,
+# /v1/admin/*. Prometheus scrapes with this credential and the console holds
+# it server-side.
+#   placeholder -- replace from scripts/mint-prod-keys.sh
+admin_key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[routes]
+fast = ["fast", "slow"]
+slow = ["slow"]
+
+# No [providers.*] sections, so both providers resolve to the synthetic fleet
+# and the console reports "simulation". That is the whole deployment: a real
+# system with no LLM spend. See switchyard.company.example.toml for what a
+# company changes, which is this section and nothing else.
+
+[timeouts]
+connect_s = 2.0
+ttft_s = 8.0
+inter_token_s = 10.0
+total_s = 300.0
+
+[breaker]
+failure_threshold = 0.5
+min_samples = 10
+cooldown_s = 5.0
+half_open_probes = 2
+
+# Floors add up to 8 of 12, leaving 4 shared. Sized by Little's law against
+# the demo's offered rates: `switchyard verify` prints the arithmetic.
+[[tenants]]
+id = "acme"
+#   placeholder -- replace from scripts/mint-prod-keys.sh
+key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+weight = 3.0
+reserved_concurrency = 4
+max_concurrency = 10
+budget_tokens = 2_000_000
+# Deliberately shallow. A 256-deep queue absorbs the demo's flood instead of
+# refusing it, which hides the admission-control half of the story -- the
+# console's own scenario check reported exactly that.
+max_queue_depth = 40
+deadline_s = 30.0
+
+[[tenants]]
+id = "globex"
+#   placeholder -- replace from scripts/mint-prod-keys.sh
+key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+weight = 1.0
+reserved_concurrency = 3
+max_concurrency = 8
+budget_tokens = 500_000
+max_queue_depth = 64
+deadline_s = 30.0
+
+[[tenants]]
+id = "initech"
+#   placeholder -- replace from scripts/mint-prod-keys.sh
+key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+weight = 1.0
+reserved_concurrency = 1
+max_concurrency = 4
+budget_tokens = 50_000
+max_queue_depth = 32
+deadline_s = 15.0

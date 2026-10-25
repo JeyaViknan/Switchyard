@@ -21,3 +21,4 @@ results/
 # Tenant spend, written at runtime.
 switchyard-state.json
 *.state.json
+deploy/local/

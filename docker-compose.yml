@@ -51,6 +51,26 @@ services:
       timeout: 3s
       retries: 10
 
+  console:
+    build: .
+    command: >
+      uvicorn switchyard.console.app:create_app --factory
+      --host 0.0.0.0 --port 8080 --loop uvloop --http httptools --no-access-log
+    environment:
+      CONSOLE_GATEWAY_URL: http://gateway:8000
+      CONSOLE_FLEET_URL: http://fleet:8100
+      CONSOLE_PROMETHEUS_URL: http://prometheus:9090
+      CONSOLE_GRAFANA_URL: http://localhost:3000
+      CONSOLE_PUBLIC_API_URL: http://localhost:8000
+      # Development keys, committed on purpose: see switchyard.toml.
+      SWITCHYARD_ADMIN_KEY: sk_sy_admin_672e27a104b9ede9182f129f4b288395
+      CONSOLE_DEMO_KEYS: '{"acme":"sk_sy_acme_b6525e6c60405226fc726bdda422dd2f","globex":"sk_sy_globex_834d97c4fbd22ebe7a67696345b8693f","initech":"sk_sy_initech_64b4a01257ee3b9d7b2caf98079f8886"}'
+      CONSOLE_PASSWORD: demo
+      CONSOLE_SESSION_SECRET: local-development-not-a-secret
+    ports: ["8080:8080"]
+    depends_on:
+      gateway: {condition: service_healthy}
+
   prometheus:
     image: prom/prometheus:latest
     volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]

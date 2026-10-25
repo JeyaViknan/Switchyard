@@ -1,0 +1,145 @@
+# The deployed stack: five containers from one image, promoted by SHA.
+#
+# Nothing here builds. The image is built once in CI, scanned, and pushed to
+# GHCR by commit SHA; the instance pulls that exact tag. Building on the
+# server would mean the thing running was never the thing tested.
+#
+# Run with deploy/compose.local.yml layered on top to build locally instead
+# (`make prod-local`), which is also the demo fallback if AWS or the venue
+# wifi is unavailable.
+
+# Paths differ between the instance and a laptop, and nothing else does.
+# Compose *merges* env_file lists rather than replacing them, so an override
+# file cannot swap /etc/switchyard for ./local -- it would demand both. Making
+# the location a variable keeps one definition of the topology instead of two
+# that have to be kept in step.
+#
+#   instance:  defaults below
+#   laptop:    SWITCHYARD_ENV_DIR=./local etc., set by `make prod-local`
+
+x-logging: &logging
+  # Without a cap, json-file logs grow until the 30 GB root volume is full,
+  # which takes out every container at once and is a miserable way to find
+  # out about log rotation.
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  fleet:
+    image: ${IMAGE_TAG:?set IMAGE_TAG to the commit sha being deployed}
+    command: >
+      uvicorn switchyard.synthetic.app:app --host 0.0.0.0 --port 8100
+      --loop uvloop --http httptools --no-access-log
+    # No published ports. The fault-injection control API has no auth, so it
+    # must never be reachable from outside the compose network.
+    expose: ["8100"]
+    restart: unless-stopped
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    image: ${IMAGE_TAG:?set IMAGE_TAG to the commit sha being deployed}
+    command: >
+      uvicorn switchyard.gateway.app:create_app --factory
+      --host 0.0.0.0 --port 8000 --loop uvloop --http httptools --no-access-log
+    # One env file per service, so the gateway never sees the console
+    # password and Grafana never sees the key pepper. Written from SSM at
+    # deploy time, mode 600, root-owned.
+    env_file: ["${SWITCHYARD_ENV_DIR:-/etc/switchyard}/gateway.env"]
+    environment:
+      SWITCHYARD_CONFIG: /app/switchyard.toml
+      SWITCHYARD_FLEET_URL: http://fleet:8100
+      SWITCHYARD_STATE_FILE: /var/lib/switchyard/state.json
+      SWITCHYARD_LOG_FORMAT: json
+    volumes:
+      - "${SWITCHYARD_CONFIG_FILE:-./switchyard.prod.toml}:/app/switchyard.toml:ro"
+      # Tenant spend. On the host filesystem rather than a named volume so it
+      # survives `compose down -v` and can be inspected with cat.
+      - "${SWITCHYARD_STATE_DIR:-/opt/switchyard/state}:/var/lib/switchyard"
+    ports: ["8000:8000"]
+    depends_on:
+      fleet: { condition: service_healthy }
+    # drain_timeout_s is 30; Docker's default SIGKILL at 10s would cut every
+    # graceful shutdown to a third of its budget.
+    stop_grace_period: 40s
+    restart: unless-stopped
+    logging: *logging
+    healthcheck:
+      # Readiness, not liveness: `depends_on: service_healthy` below is asking
+      # "can this take traffic", and a draining gateway cannot. Compose does
+      # not restart unhealthy containers, so reporting unhealthy mid-drain
+      # costs nothing. (The Dockerfile's own HEALTHCHECK uses /livez, which is
+      # the right default for a runtime that *does* restart on unhealthy.)
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  console:
+    image: ${IMAGE_TAG:?set IMAGE_TAG to the commit sha being deployed}
+    command: >
+      uvicorn switchyard.console.app:create_app --factory
+      --host 0.0.0.0 --port 8080 --loop uvloop --http httptools --no-access-log
+    env_file: ["${SWITCHYARD_ENV_DIR:-/etc/switchyard}/console.env"]
+    environment:
+      CONSOLE_GATEWAY_URL: http://gateway:8000
+      CONSOLE_FLEET_URL: http://fleet:8100
+      CONSOLE_PROMETHEUS_URL: http://prometheus:9090
+    ports: ["80:8080"]
+    depends_on:
+      gateway: { condition: service_healthy }
+    restart: unless-stopped
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    # Pinned. `:latest` on a monitoring stack means the thing that tells you
+    # something changed is itself changing without a commit.
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 3 days on a 30 GB disk shared with images and logs. Long enough to
+      # look back at yesterday's incident, short enough not to fill the box.
+      - --storage.tsdb.retention.time=3d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.prod.yml:/etc/prometheus/prometheus.yml:ro
+      # The admin key Prometheus scrapes with, as a file rather than inline in
+      # the config, so the credential is not committed to git.
+      - "${SWITCHYARD_ENV_DIR:-/etc/switchyard}/scrape-key:/etc/prometheus/scrape-key:ro"
+      - prometheus-data:/prometheus
+    expose: ["9090"]
+    restart: unless-stopped
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    env_file: ["${SWITCHYARD_ENV_DIR:-/etc/switchyard}/grafana.env"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      # Viewer, not Admin. Port 3000 is open to the internet on the free-tier
+      # setup, and anonymous Admin would let anyone edit datasources and
+      # alerting -- including the Telegram token.
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  prometheus-data:
+  grafana-data:
