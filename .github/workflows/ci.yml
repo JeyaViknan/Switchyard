@@ -124,16 +124,24 @@ jobs:
           SWITCHYARD_STATE_DIR=./local/state \
             docker compose -f deploy/compose.prod.yml -f deploy/compose.local.yml up -d
 
+      # Both, not just the gateway. The console has `depends_on: gateway
+      # service_healthy`, so it only *starts* once the gateway is ready --
+      # waiting on the gateway alone and then smoking the console raced the
+      # console's own boot, and failed with a connection reset.
       - name: Wait for readiness
         run: |
-          for i in $(seq 1 60); do
-            if curl -fsS --max-time 2 http://localhost:8000/readyz >/dev/null 2>&1; then
-              echo "ready after ${i}s"; exit 0
-            fi
-            sleep 1
-          done
-          echo "gateway never became ready" >&2
-          exit 1
+          wait_for() {
+            for i in $(seq 1 90); do
+              if curl -fsS --max-time 2 "$2" >/dev/null 2>&1; then
+                echo "  $1 ready after ${i}s"; return 0
+              fi
+              sleep 1
+            done
+            echo "$1 never became ready" >&2
+            return 1
+          }
+          wait_for gateway http://localhost:8000/readyz
+          wait_for console http://localhost/healthz
 
       # The real check: a completion through auth, scheduler, budget, adapter,
       # provider and the SSE pump, and the sha that answered is the sha built.
