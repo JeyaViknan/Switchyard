@@ -20,7 +20,7 @@ PYTHON ?= python3
 
 .PHONY: install test lint typecheck test-all check bench bench-baseline bench-fairness bench-faults \
         scenario noisy-neighbour provider-outage verify demo dev up down clean \
-        prod-local prod-local-down secrets
+        prod-local prod-local-down secrets guide
 
 install:
 	@$(PYTHON) -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' \
@@ -128,5 +128,12 @@ prod-local-down:
 down:
 	docker compose down -v
 
+# The interview guide. Twice, because TikZ positioning needs the second pass
+# to resolve node references written on the first.
+guide:
+	cd docs && pdflatex -interaction=nonstopmode -halt-on-error DEVOPS-INTERVIEW-GUIDE.tex >/dev/null
+	cd docs && pdflatex -interaction=nonstopmode -halt-on-error DEVOPS-INTERVIEW-GUIDE.tex >/dev/null
+	@echo "built docs/DEVOPS-INTERVIEW-GUIDE.pdf"
+
 clean:
-	rm -rf results/*.parquet .pytest_cache .ruff_cache .mypy_cache
+	rm -rf results/*.parquet .pytest_cache .ruff_cache .mypy_cache docs/*.aux docs/*.log docs/*.out

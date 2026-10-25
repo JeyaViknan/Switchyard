@@ -22,3 +22,10 @@ results/
 switchyard-state.json
 *.state.json
 deploy/local/
+
+# LaTeX build artefacts. The .tex is the source; build it with `make guide`.
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.pdf
