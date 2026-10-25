@@ -38,9 +38,18 @@ typecheck:
 test:
 	$(PY) -m pytest -q
 
-# Includes the scenario end-to-end tests, which start services and run load.
+# Everything, including the tests that start real services and drive load.
+#
+# Two invocations, not one. The slow tests measure real timing, so running
+# them in the same process as 370 others means they measure that process's
+# accumulated state as much as the system: the load generator's own p99
+# scheduling lag rises from 0.7% of request latency to 7.5% (threshold 5%)
+# and the run is correctly judged untrustworthy. A fresh interpreter restores
+# the quiet conditions a timing measurement needs. Same reason CI does not
+# run the benchmarks on a shared runner.
 test-all:
-	$(PY) -m pytest -q -m ""
+	$(PY) -m pytest -q
+	$(PY) -m pytest -q -m slow
 
 check: lint typecheck test
 

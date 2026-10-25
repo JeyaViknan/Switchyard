@@ -272,6 +272,17 @@ class GatewayConfig:
             name=provider, base_url=f"{self.fleet_url.rstrip('/')}/v1/{provider}"
         )
 
+    def kind_of(self, provider: str) -> str:
+        """Whether traffic goes to the built-in fleet or somewhere real.
+
+        The console shows this as its Simulation banner, so it has to be
+        derived from configuration rather than asserted by a flag someone can
+        forget to flip. Deliberately returns only the kind: the base URL and
+        the name of the key's environment variable are both things an admin
+        endpoint should not hand out.
+        """
+        return "external" if provider in self.provider_endpoints else "synthetic"
+
     @property
     def real_providers(self) -> tuple[str, ...]:
         """Providers pointed at something other than the synthetic fleet."""

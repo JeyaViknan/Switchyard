@@ -185,6 +185,15 @@ BREAKER_STATE = Gauge(
     ["provider"], registry=REGISTRY,
 )
 
+# The conventional "info" shape: a gauge fixed at 1 whose labels carry the
+# facts. Lets a dashboard or alert join on the running version -- "errors rose
+# at the same moment the sha changed" is a question you want answerable.
+BUILD_INFO = Gauge(
+    "switchyard_build_info",
+    "Build identity of the running process. Always 1; read the labels.",
+    ["version", "git_sha"], registry=REGISTRY,
+)
+
 PROVIDER_SKIPPED = Counter(
     "switchyard_provider_skipped_total",
     "Requests not sent to a provider because its breaker was open.",

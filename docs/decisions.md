@@ -629,3 +629,92 @@ A green local suite and a red CI suite are not a contradiction to be explained
 away; they are two different environments disagreeing, and the disagreement is
 the information. The gap here was one word -- `-m` -- and it hid the fact that
 no test had executed in CI for two months.
+
+## M1 -- liveness, readiness, and build identity
+
+### Why /livez and /readyz are different endpoints
+
+One health endpoint has to answer two questions that want opposite actions.
+A failed *readiness* check should stop traffic arriving. A failed *liveness*
+check should restart the container. Most of the time both answers agree, so
+one endpoint seems sufficient -- until the gateway drains.
+
+Draining is exactly the state where they disagree. The gateway is deliberately
+refusing new work while it finishes the streams it already holds. Readiness
+must fail, so the load balancer stops sending. Liveness must hold, because
+restarting then would kill the in-flight requests the drain exists to protect
+-- the 30-second drain would become a 30-second window in which any restart
+destroys work.
+
+So `/livez` returns 200 always, and deliberately reads no scheduler state: a
+liveness probe that a busy or wedged subsystem can fail will restart a process
+that was about to recover. `/readyz` keeps the old behaviour, 503 while
+draining. `/health` stays as an alias of `/readyz` because that is what every
+existing caller already uses. The Dockerfile's HEALTHCHECK asks `/livez`;
+Compose's `depends_on: service_healthy` asks `/readyz`, because "has it
+started" and "can it take traffic" are different gates.
+
+### Build identity on the readiness endpoint
+
+A deploy that cannot answer "which commit is actually serving?" asks to be
+trusted. `/readyz` now carries `version`, `git_sha`, `started_at` and
+`uptime_s`, and there is a `switchyard_build_info{version,git_sha}` gauge
+fixed at 1 -- the conventional info-metric shape, so a dashboard can join on
+it and answer "did errors rise when the sha changed?".
+
+The sha comes from `SWITCHYARD_GIT_SHA`, set from a Docker build argument.
+Outside a built image it reads `dev` rather than inventing a commit: "not
+built by the pipeline" is the true answer for a laptop run. Uptime is measured
+with `time.monotonic()`, because the wall clock can step under an NTP
+correction or a suspended laptop and produce an uptime that goes backwards.
+
+Putting it on readiness rather than a new endpoint is deliberate: the deploy
+smoke test already calls `/readyz`, so it can confirm the intended SHA is the
+one answering in the same request that proves the gateway is up. A rollback is
+confirmed the same way.
+
+### Provider kind, without leaking the endpoint
+
+`/v1/providers` now reports `kind` as `synthetic` or `external`. The console
+turns this into its Simulation banner, so it is derived from configuration
+rather than a flag someone can forget to flip. A provider explicitly declared
+under `[providers.*]` reports `external` even when its base URL happens to
+point at the synthetic fleet, which is the honest answer: an operator has
+taken responsibility for where that traffic goes.
+
+It reports only the kind. The base URL and the name of the environment
+variable holding the key are both things an admin endpoint should not hand
+out, and a test asserts neither appears in the response.
+
+### stop_grace_period, or why the drain was being cut short
+
+`drain_timeout_s` is 30 seconds. Docker sends SIGTERM, waits **10** seconds by
+default, then SIGKILLs. Every drain was therefore being cut off at a third of
+its budget, killing in-flight streams the gateway was still finishing -- the
+graceful shutdown worked perfectly and was then shot. `stop_grace_period: 40s`
+gives the drain its full 30 seconds plus headroom for the final spend flush
+that follows it.
+
+### The base image is pinned by digest
+
+`python:3.14-slim` moves. A base image that changes underneath you makes a
+reproducible build a coincidence, and it is the layer with the most CVEs and
+the least visibility. Pinned to the multi-arch index digest, so linux/amd64
+(the EC2 host) and linux/arm64 (an Apple Silicon laptop) both still resolve
+from the one pin. The readable tag stays in a comment.
+
+### A timing test that was measuring the host
+
+Adding sixteen tests made `test_generator_health_reflects_lag_relative_to_the
+_workload` fail -- not because anything broke, but because it asserts the load
+generator could fire on schedule, and a machine busy from 370 preceding tests
+cannot. Measured: p99 scheduling lag is 1.37ms (0.66% of request latency) when
+that module runs alone and 15.75ms (7.54%) behind the full suite, against a 5%
+threshold. The flag was telling the truth; the assertion was about the host.
+
+Marked `slow`, matching the reasoning CI already applies to the benchmarks --
+meaningful latency numbers need a quiet machine. `make test-all` then still
+failed, because it ran the slow tests behind everything else in the same
+process. Splitting it into two pytest invocations fixed that: a fresh
+interpreter restores the conditions a timing measurement needs. No assertion
+was weakened.

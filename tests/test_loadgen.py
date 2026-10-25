@@ -91,6 +91,14 @@ async def test_latency_is_measured_from_intended_start(fleet_server):
     assert record.latency == pytest.approx(2.0)
 
 
+# Marked slow because it asserts a property of the host, not of Switchyard:
+# `generator_healthy` is the load generator's self-check on whether it could
+# fire on schedule, and on a busy machine it honestly cannot. Measured here:
+# p99 lag is 1.37ms (0.66% of latency) when this module runs alone and 15.75ms
+# (7.54%) behind the full suite, against a 5% threshold. Same reasoning the CI
+# workflow already applies to the benchmarks -- meaningful latency numbers need
+# a quiet machine, and a shared runner is not one. `make test-all` runs it.
+@pytest.mark.slow
 async def test_generator_health_reflects_lag_relative_to_the_workload(fleet_server):
     """The same absolute lag is fine for a slow workload and disqualifying for a fast one.
 

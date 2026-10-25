@@ -35,6 +35,7 @@ from switchyard.adapters.openai_compatible import (
     OpenAICompatibleAdapter,
     build_client,
 )
+from switchyard.buildinfo import build_info
 from switchyard.core.auth import (
     AdminAuthError,
     AuthError,
@@ -57,6 +58,7 @@ from switchyard.obs.metrics import (
     BUDGET_REMAINING,
     BUDGET_RESERVED,
     BUDGET_SPENT,
+    BUILD_INFO,
     CAPACITY_UTILISATION,
     DISPATCHED,
     FAILOVERS,
@@ -356,6 +358,8 @@ def create_app(
         for name in providers:
             BREAKER_STATE.labels(provider=name).set(0)
             PROVIDER_SKIPPED.labels(provider=name)
+        info = build_info()
+        BUILD_INFO.labels(version=info.version, git_sha=info.git_sha).set(1)
 
     def publish_scheduler_gauges() -> None:
         stats = scheduler.stats()
@@ -631,6 +635,7 @@ def create_app(
         """
         snapshot = provider_health.snapshot()
         for name, entry in snapshot.items():
+            entry["kind"] = config.kind_of(name)
             entry["routes_serving"] = [
                 model for model in ({*config.routes, *providers})
                 if name in app.state.router.candidates(model)
@@ -645,13 +650,34 @@ def create_app(
         publish_scheduler_gauges()
         return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
-    @app.get("/health")
-    async def health(response: Response) -> dict[str, Any]:
-        """Readiness, not liveness.
+    @app.get("/livez")
+    async def livez() -> dict[str, str]:
+        """Liveness: can this process still answer at all?
 
-        Returns 503 while draining so a load balancer stops sending new traffic
-        while in-flight requests are still being finished. The process is still
-        working -- it just should not be given anything more.
+        Always 200, including while draining. The distinction matters because
+        the two checks have opposite consequences: a failed readiness check
+        should stop traffic arriving, while a failed liveness check should
+        restart the container. Draining is the case where those differ -- the
+        gateway is deliberately refusing new work while it finishes what it
+        holds, and restarting it then would kill exactly the in-flight requests
+        the drain exists to protect.
+
+        Deliberately reads no scheduler state: a liveness probe that can be
+        made to fail by a busy or wedged subsystem will restart a process that
+        was about to recover.
+        """
+        return {"status": "alive"}
+
+    def _readiness(response: Response) -> dict[str, Any]:
+        """Readiness: should this process be given new work?
+
+        503 while draining, so a load balancer stops sending traffic while
+        in-flight requests finish. The process is still working -- it just
+        should not be given anything more.
+
+        Carries build identity because this is the endpoint a deploy smoke
+        test already calls: it can confirm the SHA it meant to ship is the one
+        answering, in the same request that proves the gateway is up.
         """
         draining = scheduler.draining
         if draining:
@@ -662,7 +688,17 @@ def create_app(
             "policy": config.scheduling_policy,
             "max_concurrency": config.max_concurrency,
             "inflight": scheduler.stats().inflight,
+            **build_info().as_dict(),
         }
+
+    @app.get("/readyz")
+    async def readyz(response: Response) -> dict[str, Any]:
+        return _readiness(response)
+
+    @app.get("/health")
+    async def health(response: Response) -> dict[str, Any]:
+        """Kept as an alias of /readyz: it is what every existing caller uses."""
+        return _readiness(response)
 
     return app
 

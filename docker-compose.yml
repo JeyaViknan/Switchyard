@@ -38,8 +38,15 @@ services:
     ports: ["8000:8000"]
     depends_on:
       fleet: {condition: service_healthy}
+    # Drain is 30s (gateway.drain_timeout_s). Docker sends SIGTERM, waits 10s
+    # by default, then SIGKILLs -- which cut every drain short at a third of
+    # its budget and killed in-flight streams the gateway was still finishing.
+    # 40s leaves headroom for the final spend flush after the drain completes.
+    stop_grace_period: 40s
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      # Readiness here, not liveness: `depends_on: service_healthy` is asking
+      # "can this take traffic yet", and a draining gateway cannot.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/readyz')"]
       interval: 5s
       timeout: 3s
       retries: 10
