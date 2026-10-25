@@ -718,3 +718,112 @@ failed, because it ran the slow tests behind everything else in the same
 process. Splitting it into two pytest invocations fixed that: a fresh
 interpreter restores the conditions a timing measurement needs. No assertion
 was weakened.
+
+## M2 -- the console backend
+
+### Why a second app rather than routes on the gateway
+
+The console holds the admin credential, polls four services once a second and
+can generate load. None of that belongs in the request path of a gateway whose
+entire argument is careful control of scarce capacity. A separate ASGI app in
+the same package and the same image keeps them apart at runtime while keeping
+one thing to build, version and deploy.
+
+It also makes the trust boundary obvious: the gateway's admin endpoints stay
+admin-only, and the console is the one process holding the key. The browser
+never receives a credential -- the snapshot it renders is derived numbers.
+
+### Counters in, rates out, and the two traps
+
+The gateway exposes monotonic totals. A live view needs the opposite, so the
+collector keeps the previous scrape and divides the difference by elapsed
+time. Two things make that harder than it sounds.
+
+**Counters reset.** A gateway restart sends every total to zero. Subtracting
+naively gives a large negative number, which renders as a spike in the wrong
+direction. A value below the previous one can only mean a restart, so the
+delta is the new value itself -- slightly understating the first interval
+after a restart, which is the right direction to be wrong in.
+
+**Percentiles do not average.** A p95 over the last minute is not the mean of
+per-second p95s. It is recomputed from the difference in cumulative histogram
+buckets across the window, interpolating inside whichever bucket holds the
+95th observation. The resolution is bounded by the bucket edges, so the UI
+labels it approximate rather than implying precision it does not have. When
+nothing was observed, it reports nothing -- zero would read as "very fast"
+instead of "no data".
+
+### Events are derived, not emitted
+
+Nothing in the gateway tells the console that a breaker opened. The collector
+notices a value changed between two snapshots and writes the sentence. That
+keeps console concerns out of the gateway, and lets the feed say what a change
+*meant* -- "breaker for 'fast' opened; traffic now goes to the next provider"
+-- rather than echoing a state name.
+
+### A demo that is allowed to fail
+
+The guided scenarios score themselves from the same snapshots the live map
+draws. Checks start `pending`, not `pass`: a demo showing green before
+anything has happened teaches the audience to ignore it. If the gateway
+genuinely fails to protect the quiet tenant, the console says FAIL in front of
+everyone. A demo that cannot fail is an animation.
+
+### Caps, because this runs on a t3.micro
+
+Total offered load is capped at 30 rps, open streams at 120, and every profile
+auto-stops after 120 seconds. The caps are enforced in `Profile.validate()`
+and tested, not written in a comment and hoped for. Over the cap, arrivals are
+*dropped and counted* rather than queued: queueing would quietly turn the
+generator closed-loop, which is the measurement error the open-loop design
+exists to avoid, and the count lets the console say the generator was the
+limit rather than the gateway.
+
+### Four bugs found by running the demo end to end
+
+The outage scenario failed its `recovered` check, which looked like a flaky
+test. It was not.
+
+1. **`clear()` was a no-op.** The fleet's control endpoint applies a *patch*,
+   and `{"faults": {}}` is an empty patch. The provider stayed broken after
+   the "recovery", every breaker probe failed, and the cooldown doubled to 34
+   seconds. Clearing now sets each fault rate to zero explicitly.
+2. **`error_class` was read as a fault.** It is always populated -- it says
+   what kind of error *would* be returned -- so filtering faults by
+   truthiness painted every healthy provider as faulty. Only the three rates
+   (`error_rate`, `abort_rate`, `stall_rate`) mean something is wrong.
+3. **The profiles response was misread.** It wraps the provider map beside the
+   run seed; the collector indexed the envelope and found nothing, so injected
+   faults never appeared in the UI at all.
+4. **`{"stall": true}` would have raised.** There is no boolean `stall` field;
+   there is a `stall_rate`, because a provider stalling one request in ten is
+   a different failure from one stalling every time. The toggle means
+   "always", and the console is what knows that.
+
+All four are regression-tested, including one test that deliberately pins the
+fleet's patch semantics so a future change to replace-semantics is caught
+rather than silently fixing and then re-breaking this.
+
+### The recovery phase waits instead of guessing
+
+The breaker's cooldown doubles on each failed probe, so how long recovery
+takes depends on how long the outage lasted -- after 25 seconds of total
+failure it had backed off past any fixed window. Rather than weaken the check
+or pretend the backoff is not there, the recovery phase ends as soon as the
+breaker closes, with a generous bound. The outage is 15 seconds for the same
+reason: long enough to show the breaker open and traffic move, short enough
+that the recovery half of the story still arrives.
+
+Related: the steady traffic profile now runs longer than the scenario. A
+half-open breaker closes by succeeding on a probe, and a probe needs a
+request -- if the generator stops first, the breaker can never close and the
+demo ends on a failure that is an artefact of the generator.
+
+### The session cookie cannot be Secure
+
+The free-tier deployment is plain HTTP: no load balancer, no certificate, no
+budget for either. A `Secure` cookie would never be sent, so it is not set.
+That is a real weakness, recorded rather than hidden -- anyone on the path can
+read the cookie and drive the demo controls. It guards buttons that generate
+synthetic load against a synthetic fleet, which is the only reason it is
+tolerable. HTTPS is the first thing to buy.

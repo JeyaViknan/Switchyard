@@ -366,13 +366,24 @@ Write this up as `docs/production.md` and ship `deploy/switchyard.company.exampl
 
 At minimum, make sure the notes answer: why one EC2 instance and not ECS/EKS ($0 + single-process design); why recreate-with-drain and not rolling; how the pipeline proves a deploy worked; how secrets flow (SSM → root-only env files per service, OIDC, no stored keys); why standard CPU credits; why breaker-open is a warning but error rate is critical; why the console reads the same numbers as Grafana; what broke (red CI, the 10 s vs 30 s stop timeout, the config-not-in-image story already in `docs/decisions.md`) and what changed.
 
+## 11a. Pending verification
+
+Carried forward until someone actually runs it:
+
+| What | Why it is unverified | How to clear it |
+|---|---|---|
+| **Docker image build** | The Docker daemon has been down on the dev machine since M1. The Dockerfile changed substantially in M1 — base image pinned by digest, `ARG GIT_SHA`/`VERSION`, OCI labels, HEALTHCHECK moved to `/livez` — and none of it has been built. | `docker build -t switchyard:test .` then `make up`. M5 also builds it in CI, which will catch it independently. |
+| **Compose stack end to end** | Same reason. `docker compose config` parses (client-side only); no container has been started. | `make up`, then check `/readyz`, the Grafana dashboard, and `stop_grace_period` behaviour on `make down`. |
+
+Everything else claimed as done has been executed and its output recorded.
+
 ## 11. Status (update as you go)
 
 | Milestone | Status | Notes |
 |---|---|---|
 | M0 CI green | **done** | Both jobs green (run 40191532932). Three bugs, one theme — the build assumed a dev machine: CI ran `pytest` vs the Makefile's `python -m pytest` (only the latter puts the repo root on `sys.path`, so collection aborted and **no test had run since 28 Aug**); the Makefile hardcoded `.venv/bin/python`, which CI lacks; the bench printer formatted a `None` lag ratio. Runner and all action SHAs pinned, Node 20 actions upgraded. 357 tests. |
 | M1 Gateway ops refactors | **done** | `/livez` (200 while draining, reads no scheduler state) vs `/readyz` (503, carries version/git_sha/started_at/uptime); `/health` kept as an alias. `switchyard_build_info` gauge. `/v1/providers` reports `kind` without leaking base_url or key env. `stop_grace_period: 40s` — Docker's 10s SIGKILL was cutting the 30s drain to a third. Base image pinned by multi-arch digest, `ARG GIT_SHA`/`VERSION` + OCI labels. 16 new tests; one timing test marked `slow` and `make test-all` split into two processes, no assertions weakened. |
-| M2 Console backend | not started | |
+| M2 Console backend | **done** | `src/switchyard/console/`: settings, collector (1s poll, reset-safe rates, windowed p95 from bucket deltas), promtext, capped open-loop traffic (30 rps / 120 streams / 120s, enforced in `validate()`), guided scenarios with live verdicts, HMAC session auth + CSRF header, SSE. Read-only public, controls behind a session, admin key never leaves the process. 93 tests incl. an end-to-end outage demo against the synthetic fleet. Four fleet-control bugs found and regression-tested. |
 | M3 Console frontend | not started | |
 | M4 Production Compose | not started | |
 | M5 CI image/scan/publish | not started | |
