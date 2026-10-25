@@ -40,7 +40,13 @@ class Settings:
     gateway_url: str = "http://127.0.0.1:8000"
     fleet_url: str = "http://127.0.0.1:8100"
     prometheus_url: str = ""
+    # Two Grafana URLs, because they answer different questions. The link is
+    # what a browser on someone's phone must be able to open; the health URL
+    # is what this container can reach. Inside Compose those are never the
+    # same -- `localhost:3000` from here is the console itself, which is how
+    # Grafana managed to report "down" while being perfectly healthy.
     grafana_url: str = ""
+    grafana_health_url: str = ""
     public_api_url: str = ""
 
     # Held server-side and never sent to the browser.
@@ -105,6 +111,8 @@ def load_settings() -> Settings:
         fleet_url=_env("CONSOLE_FLEET_URL", "http://127.0.0.1:8100").rstrip("/"),
         prometheus_url=_env("CONSOLE_PROMETHEUS_URL").rstrip("/"),
         grafana_url=_env("CONSOLE_GRAFANA_URL").rstrip("/"),
+        grafana_health_url=(_env("CONSOLE_GRAFANA_INTERNAL_URL")
+                            or _env("CONSOLE_GRAFANA_URL")).rstrip("/"),
         public_api_url=_env("CONSOLE_PUBLIC_API_URL").rstrip("/"),
         admin_key=_env("SWITCHYARD_ADMIN_KEY"),
         demo_keys=demo_keys,

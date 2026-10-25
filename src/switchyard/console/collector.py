@@ -91,6 +91,17 @@ class Collector:
         response.raise_for_status()
         return response.json()
 
+    async def _get_ok(self, url: str) -> bool:
+        """Is this endpoint answering? Status only, body ignored.
+
+        Prometheus's /-/ready replies with plain text, so parsing it as JSON
+        raised and the console reported a perfectly healthy Prometheus as
+        down. Liveness probes answer in whatever shape they like; only the
+        status code is a contract.
+        """
+        response = await self.client.get(url, timeout=POLL_TIMEOUT_S)
+        return response.status_code < 400
+
     async def _get_text(self, url: str, headers: dict[str, str] | None = None) -> str:
         response = await self.client.get(url, headers=headers or {},
                                          timeout=POLL_TIMEOUT_S)
@@ -126,10 +137,10 @@ class Collector:
                 self._try(self._get_text(f"{gw}/metrics", admin)),
                 self._try(self._fleet_profiles()),
                 self._try(self._get_json(f"{self.settings.fleet_url}/health")),
-                self._try(self._get_json(f"{self.settings.prometheus_url}/-/ready"))
+                self._try(self._get_ok(f"{self.settings.prometheus_url}/-/ready"))
                 if self.settings.prometheus_url else _none(),
-                self._try(self._get_json(f"{self.settings.grafana_url}/api/health"))
-                if self.settings.grafana_url else _none(),
+                self._try(self._get_ok(f"{self.settings.grafana_health_url}/api/health"))
+                if self.settings.grafana_health_url else _none(),
             )
         )
 
@@ -194,7 +205,7 @@ class Collector:
                 "gateway": "draining" if draining else ("ready" if gateway_up else "down"),
                 "fleet": "up" if fleet_up else "down",
                 "prometheus": self._optional(self.settings.prometheus_url, prometheus_up),
-                "grafana": self._optional(self.settings.grafana_url, grafana_up),
+                "grafana": self._optional(self.settings.grafana_health_url, grafana_up),
             },
             "gateway": self._gateway(readyz, stats, draining),
             "tenants": self._tenants(stats, scrape, previous),

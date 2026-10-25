@@ -2,14 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Feature branches get CI too. Until now this listed main only, so a push
+    # to a branch ran nothing and the first signal arrived at merge time --
+    # which is the point at which it is most expensive to be wrong.
+    branches: [main, devops]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
+  # ---------------------------------------------------------------- tests
   check:
     # Pinned, not `ubuntu-latest`: the image migrates (Ubuntu 26 from 19 Oct
     # 2026) and an unpinned runner changes under you with no commit to blame.
@@ -33,16 +40,195 @@ jobs:
       - run: mypy src/switchyard/core src/switchyard/adapters src/switchyard/types.py
       # ruff and mypy never import the package, so an import error reaches us
       # only here. Collecting separately keeps "the suite could not load" and
-      # "a test failed" from looking like the same red X.
+      # "a test failed" from rendering as the same red X.
       - name: Collect tests
         run: pytest --collect-only -q
       - run: pytest -q
+      # The product's own opinion of both configurations. Structure only --
+      # it reads digests, never secrets, so a throwaway pepper is enough for
+      # the prod file's placeholder hashes to parse.
+      - name: Validate configurations
+        env:
+          SWITCHYARD_KEY_PEPPER: ci-throwaway-pepper
+        run: |
+          switchyard check
+          switchyard check --config deploy/switchyard.prod.toml
 
-  # The benchmark suite is not run on every push: it needs a quiet machine to
-  # produce meaningful latency numbers, and a shared CI runner is not that.
-  # Run manually to regenerate figures; the numbers in the report come from a
-  # controlled environment, not from here.
+  # -------------------------------------------------------- build and scan
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          # Loaded into the local daemon rather than pushed: this image is a
+          # candidate until the scan and the smoke test have had their say.
+          load: true
+          tags: switchyard:ci
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+          # linux/amd64 only here. The t3.micro is amd64, and building arm64
+          # under emulation for a throwaway scan costs minutes for nothing;
+          # the release workflow stays multi-arch.
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: switchyard:ci
+          severity: HIGH,CRITICAL
+          # Fail only on what can actually be fixed. A CVE with no patch
+          # available is information, not a reason to block every merge until
+          # upstream ships -- and a gate that cannot be satisfied is one
+          # people learn to bypass.
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+      - name: Record what shipped
+        run: docker image inspect switchyard:ci --format '{{json .Config.Labels}}'
+
+  # ------------------------------------------------------ run it for real
+  smoke:
+    needs: [image]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.14"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      # Rebuilt rather than carried between jobs: with the GHA cache this is
+      # seconds, where shipping a 200 MB tarball through the artifact store
+      # and back is minutes.
+      - name: Build from cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: switchyard:local
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha
+
+      - name: Start the production stack
+        run: |
+          ./scripts/dev-secrets.sh
+          IMAGE_TAG=switchyard:local SWITCHYARD_ENV_DIR=./local \
+          SWITCHYARD_CONFIG_FILE=./local/switchyard.toml \
+          SWITCHYARD_STATE_DIR=./local/state \
+            docker compose -f deploy/compose.prod.yml -f deploy/compose.local.yml up -d
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://localhost:8000/readyz >/dev/null 2>&1; then
+              echo "ready after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "gateway never became ready" >&2
+          exit 1
+
+      # The real check: a completion through auth, scheduler, budget, adapter,
+      # provider and the SSE pump, and the sha that answered is the sha built.
+      - name: Smoke
+        env:
+          SMOKE_TENANT_KEY: sk_sy_acme_b6525e6c60405226fc726bdda422dd2f
+        run: ./deploy/smoke.sh "${{ github.sha }}" http://localhost
+
+      - name: Verify the configuration under load
+        run: |
+          pip install -e ".[dev]"
+          switchyard verify --config deploy/local/switchyard.toml
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          IMAGE_TAG=switchyard:local SWITCHYARD_ENV_DIR=./local \
+          SWITCHYARD_CONFIG_FILE=./local/switchyard.toml \
+          SWITCHYARD_STATE_DIR=./local/state \
+            docker compose -f deploy/compose.prod.yml -f deploy/compose.local.yml logs --tail 120
+
+      - name: Tear down
+        if: always()
+        run: |
+          IMAGE_TAG=switchyard:local SWITCHYARD_ENV_DIR=./local \
+          SWITCHYARD_CONFIG_FILE=./local/switchyard.toml \
+          SWITCHYARD_STATE_DIR=./local/state \
+            docker compose -f deploy/compose.prod.yml -f deploy/compose.local.yml down -v
+
+  # --------------------------------------------------------------- publish
+  publish:
+    # Only a commit that is on main, has passed the tests, been scanned and
+    # actually served a request becomes an image anyone can pull.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, image, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push by commit sha
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          push: true
+          # The full sha is the deployable identity; :main is a convenience
+          # for humans. Deploys always name the sha, so a rollback is just the
+          # previous one -- a moving tag could not express that.
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ------------------------------------------------------------- terraform
+  terraform:
+    # Runs only when the infrastructure changes. `infra/` arrives in M6; until
+    # then the path filter means this job simply never triggers.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Has infra changed?
+        id: changed
+        run: |
+          if [ -d infra ]; then echo "run=true" >> "$GITHUB_OUTPUT";
+          else echo "run=false" >> "$GITHUB_OUTPUT"; echo "no infra/ yet"; fi
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+        if: steps.changed.outputs.run == 'true'
+        with: { terraform_version: "1.10.5" }
+      - name: Validate
+        if: steps.changed.outputs.run == 'true'
+        working-directory: infra
+        run: |
+          terraform fmt -check -recursive
+          # -backend=false: validation must not need credentials or touch
+          # remote state. Nothing here reaches AWS.
+          terraform init -backend=false
+          terraform validate
+
+  # ------------------------------------------------------------- benchmarks
   bench:
+    # Not on every push: meaningful latency numbers need a quiet machine and a
+    # shared runner is not that. Run manually to regenerate figures; the
+    # numbers in the report come from a controlled environment.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:

@@ -60,7 +60,10 @@ services:
       CONSOLE_GATEWAY_URL: http://gateway:8000
       CONSOLE_FLEET_URL: http://fleet:8100
       CONSOLE_PROMETHEUS_URL: http://prometheus:9090
+      # The link a browser opens, and the address this container can reach.
+      # They are never the same inside Compose.
       CONSOLE_GRAFANA_URL: http://localhost:3000
+      CONSOLE_GRAFANA_INTERNAL_URL: http://grafana:3000
       CONSOLE_PUBLIC_API_URL: http://localhost:8000
       # Development keys, committed on purpose: see switchyard.toml.
       SWITCHYARD_ADMIN_KEY: sk_sy_admin_672e27a104b9ede9182f129f4b288395
@@ -70,6 +73,14 @@ services:
     ports: ["8080:8080"]
     depends_on:
       gateway: {condition: service_healthy}
+    # Its own check. The image's default HEALTHCHECK asks :8000/livez, which
+    # is the gateway's port -- inherited here it reported the console
+    # unhealthy for as long as it ran.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   prometheus:
     image: prom/prometheus:latest

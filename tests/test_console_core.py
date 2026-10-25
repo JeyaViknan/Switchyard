@@ -258,3 +258,26 @@ def test_a_successful_login_clears_the_throttle():
     limiter.allow("ip", now=1.0)
     limiter.reset("ip")
     assert limiter.allow("ip", now=2.0)
+
+
+def test_grafana_link_and_health_url_are_separate(monkeypatch):
+    """Inside Compose they are never the same address.
+
+    The link has to be openable from a phone; the health probe has to be
+    reachable from this container. Conflating them had the console report a
+    perfectly healthy Grafana as down, because `localhost:3000` from inside
+    the console container is the console.
+    """
+    monkeypatch.setenv("CONSOLE_GRAFANA_URL", "http://203.0.113.10:3000")
+    monkeypatch.setenv("CONSOLE_GRAFANA_INTERNAL_URL", "http://grafana:3000")
+    s = load_settings()
+    assert s.grafana_url == "http://203.0.113.10:3000"
+    assert s.grafana_health_url == "http://grafana:3000"
+
+
+def test_grafana_health_url_falls_back_to_the_link(monkeypatch):
+    """One URL is the common case, and must keep working."""
+    monkeypatch.setenv("CONSOLE_GRAFANA_URL", "http://localhost:3000")
+    monkeypatch.delenv("CONSOLE_GRAFANA_INTERNAL_URL", raising=False)
+    s = load_settings()
+    assert s.grafana_health_url == "http://localhost:3000"

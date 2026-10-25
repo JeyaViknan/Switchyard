@@ -42,6 +42,7 @@ CONSOLE_DEMO_KEYS={"acme":"${ACME_KEY}","globex":"${GLOBEX_KEY}","initech":"${IN
 CONSOLE_PASSWORD=demo
 CONSOLE_SESSION_SECRET=local-development-not-a-secret
 CONSOLE_GRAFANA_URL=http://localhost:3000
+CONSOLE_GRAFANA_INTERNAL_URL=http://grafana:3000
 CONSOLE_PUBLIC_API_URL=http://localhost:8000
 CONSOLE_DEMO_CONTROLS=true
 ENV

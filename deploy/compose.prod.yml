@@ -90,6 +90,9 @@ services:
       CONSOLE_GATEWAY_URL: http://gateway:8000
       CONSOLE_FLEET_URL: http://fleet:8100
       CONSOLE_PROMETHEUS_URL: http://prometheus:9090
+      # Probed over the compose network; the browser-facing link comes from
+      # CONSOLE_GRAFANA_URL in the env file, written with the public IP.
+      CONSOLE_GRAFANA_INTERNAL_URL: http://grafana:3000
     ports: ["80:8080"]
     depends_on:
       gateway: { condition: service_healthy }
