@@ -114,10 +114,17 @@ secrets:
 PROD_LOCAL_ENV := IMAGE_TAG=switchyard:local SWITCHYARD_ENV_DIR=./local \
                   SWITCHYARD_CONFIG_FILE=./local/switchyard.toml \
                   SWITCHYARD_STATE_DIR=./local/state
-PROD_LOCAL := docker compose -f deploy/compose.prod.yml -f deploy/compose.local.yml
+PROD_LOCAL := docker compose -f deploy/compose.prod.yml
 
+# Built once, here, rather than by Compose. The gateway, fleet and console
+# are three entrypoints into one image, so three `build:` stanzas for the
+# same tag had buildx racing itself and failing with "image already exists".
+# Building first and then only running is also what the instance does -- it
+# pulls a tag and starts it -- so prod-local now differs from production in
+# exactly one way: where the image came from.
 prod-local: secrets
-	$(PROD_LOCAL_ENV) $(PROD_LOCAL) up --build -d
+	docker build -t switchyard:local .
+	$(PROD_LOCAL_ENV) $(PROD_LOCAL) up -d
 	@echo "waiting for the stack to come up..."
 	@$(PROD_LOCAL_ENV) $(PROD_LOCAL) ps --format 'table {{.Service}}\t{{.Status}}'
 	@SMOKE_TENANT_KEY=sk_sy_acme_b6525e6c60405226fc726bdda422dd2f ./deploy/smoke.sh

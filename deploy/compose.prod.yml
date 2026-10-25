@@ -4,9 +4,10 @@
 # GHCR by commit SHA; the instance pulls that exact tag. Building on the
 # server would mean the thing running was never the thing tested.
 #
-# Run with deploy/compose.local.yml layered on top to build locally instead
-# (`make prod-local`), which is also the demo fallback if AWS or the venue
-# wifi is unavailable.
+# `make prod-local` runs this same file against a locally built image, which
+# is the rehearsal and the demo fallback if AWS or the venue wifi is not
+# there. There is no separate laptop compose file: the only thing that
+# differs is where the image came from, and that is one variable.
 
 # Paths differ between the instance and a laptop, and nothing else does.
 # Compose *merges* env_file lists rather than replacing them, so an override

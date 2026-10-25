@@ -18,7 +18,24 @@ CONSOLE="${SMOKE_CONSOLE_URL:-${BASE}}"
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok  $*"; }
 
+# Wait before asserting. A smoke test that races startup reports a crash
+# when it means "not yet", and every caller would otherwise need its own
+# wait loop -- the deploy, CI and `make prod-local` each hit this. The
+# console is the slow one: it only begins starting once the gateway reports
+# healthy, so the port is bound by Docker's proxy before anything is
+# listening behind it, and the failure reads as a connection reset.
+WAIT_S="${SMOKE_WAIT_S:-90}"
+wait_for() {  # label url
+  for _ in $(seq 1 "${WAIT_S}"); do
+    curl -fsS --max-time 2 "$2" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  fail "$1 did not answer within ${WAIT_S}s ($2)"
+}
+
 echo "smoke test against ${API}"
+wait_for gateway "${API}/livez"
+wait_for console "${CONSOLE}/healthz"
 
 # 1. Liveness, then readiness. Separately, because they answer different
 #    questions and a drain makes them disagree.

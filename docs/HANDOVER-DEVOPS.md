@@ -228,7 +228,7 @@ Create `deploy/`:
 ```
 deploy/
   compose.prod.yml            # 5 services, images by ${IMAGE_TAG}, no builds
-  compose.local.yml           # override for laptops: build: .., env files from deploy/local/
+  (no compose.local.yml: paths are variables and the image is built by `make prod-local`)
   switchyard.prod.toml        # tenants acme/globex/initech with HASHES minted with the prod pepper (no raw keys)
   switchyard.company.example.toml   # real providers example (section 9)
   prometheus.prod.yml         # 15 s scrape; authorization.credentials_file: /etc/prometheus/scrape-key
@@ -248,7 +248,7 @@ scripts/dev-secrets.sh        # writes deploy/local/*.env from the committed DEV
 - Every service: pinned image versions, `json-file` logging with `max-size: 10m`, `max-file: 3`.
 - Memory: the box has 1 GB RAM plus 2 GB swap. Run `make prod-local` under the noisy-neighbour profile, record `docker stats` peaks in `docs/learning/M4.md`, and only then decide whether to set `mem_limit`s. Don't guess.
 
-`make prod-local`: builds the image locally (`IMAGE_TAG=local`), generates dev env files, runs `compose.prod.yml` + `compose.local.yml`. Console on http://localhost, API on :8000, Grafana on :3000. **This is also the demo fallback if AWS or the venue Wi-Fi fails.**
+`make prod-local`: generates dev env files, builds `switchyard:local` once, then runs `compose.prod.yml` against it. Console on http://localhost, API on :8000, Grafana on :3000. **This is also the demo fallback if AWS or the venue Wi-Fi fails.**
 
 Also add the console to the dev `docker-compose.yml` so `make up` shows it.
 
@@ -373,8 +373,8 @@ Carried forward until someone actually runs it:
 | What | Why it is unverified | How to clear it |
 |---|---|---|
 | ~~Docker image build~~ | **Cleared 25 Oct.** Built locally and in CI (~50 s on GitHub's network). Five containers up, gateway/fleet/console healthy, a streaming completion served end to end. Building the real stack found three bugs: the console inherited the gateway's healthcheck port, Prometheus `/-/ready` returns text not JSON, and `CONSOLE_GRAFANA_URL` was serving as both the browser link and the in-network probe. | — |
-| **`make prod-local`** | Needs a built image, which has not completed on this machine: the base image layer pulls at roughly 24 KB/s and had fetched 20 of 30 MB after 13 minutes. A network problem, not a Dockerfile one — the digest pin resolved, `.dockerignore` works (406 kB context), and both compose files validate. | `make prod-local`, then `docker stats` under the noisy-neighbour profile to decide whether `mem_limit`s are needed. CI (M5) will also build it on GitHub's network. |
-| **Compose stack end to end** | Same reason. `docker compose config` parses (client-side only); no container has been started. | `make up`, then check `/readyz`, the Grafana dashboard, and `stop_grace_period` behaviour on `make down`. |
+| ~~`make prod-local`~~ | **Cleared 25 Oct.** Runs green end to end: five containers, SMOKE PASS. Peak memory under the noisy-neighbour flood is 276 MiB of 1 GiB, so **no `mem_limit`s** — see `docs/learning/M4.md`. Two bugs found doing it: three `build:` stanzas for one tag raced buildx, and `smoke.sh` tested the console before it had started. | — |
+| **Pinned monitoring images on the demo machine** | `prom/prometheus:v3.1.0` and `grafana/grafana:11.5.1` pull slowly on this network. They are cached now, but a clean machine at the venue would not be. | `docker pull prom/prometheus:v3.1.0 grafana/grafana:11.5.1` before the demo. |
 
 Everything else claimed as done has been executed and its output recorded.
 
@@ -386,7 +386,7 @@ Everything else claimed as done has been executed and its output recorded.
 | M1 Gateway ops refactors | **done** | `/livez` (200 while draining, reads no scheduler state) vs `/readyz` (503, carries version/git_sha/started_at/uptime); `/health` kept as an alias. `switchyard_build_info` gauge. `/v1/providers` reports `kind` without leaking base_url or key env. `stop_grace_period: 40s` — Docker's 10s SIGKILL was cutting the 30s drain to a third. Base image pinned by multi-arch digest, `ARG GIT_SHA`/`VERSION` + OCI labels. 16 new tests; one timing test marked `slow` and `make test-all` split into two processes, no assertions weakened. |
 | M2 Console backend | **done** | `src/switchyard/console/`: settings, collector (1s poll, reset-safe rates, windowed p95 from bucket deltas), promtext, capped open-loop traffic (30 rps / 120 streams / 120s, enforced in `validate()`), guided scenarios with live verdicts, HMAC session auth + CSRF header, SSE. Read-only public, controls behind a session, admin key never leaves the process. 93 tests incl. an end-to-end outage demo against the synthetic fleet. Four fleet-control bugs found and regression-tested. |
 | M3 Console frontend | **done** | Four static files, no build step, strict CSP (asserted by tests: no inline style/script/handlers, same-origin only). Live SVG map — tenant cards, capacity drawn as per-tenant slots, provider breaker cards, rate-proportional particles, failover arcs, event feed. Pages for tenants, providers, demo, system, API. Verified in a browser against the running stack; screenshots in `docs/images/`. Three browser-only bugs found and fixed (SSE opened pre-cookie undid login; buttons rebuilt 60×/min lost clicks; text overlap at the shipping width) plus a scenario check that reported FAIL when it meant no-evidence. |
-| M4 Production Compose | **in progress** | `deploy/` written: `compose.prod.yml` (5 services by `${IMAGE_TAG}`, per-service env files, 3d retention, anonymous *Viewer*, `stop_grace_period`), `compose.local.yml`, `switchyard.prod.toml` (placeholder digests), `switchyard.company.example.toml`, `prometheus.prod.yml` (15s, `credentials_file`), `smoke.sh`, `scripts/{dev-secrets,mint-prod-keys}.sh`, `make prod-local`, console added to the dev stack. Both compose files validate and the generated local config passes `switchyard check`. **Not yet run**: the image has never built on this machine — see 11a. `deploy.sh` lands in M7. |
+| M4 Production Compose | **done** | `deploy/compose.prod.yml` (5 services by `${IMAGE_TAG}`, per-service env files, 3d retention, anonymous *Viewer*, `stop_grace_period: 40s`), `switchyard.prod.toml` (placeholder digests, queue depth 40), `switchyard.company.example.toml`, `prometheus.prod.yml` (15s, `credentials_file`), `smoke.sh`, `scripts/{dev-secrets,mint-prod-keys}.sh`, `make prod-local`, console in the dev stack. Paths are variables, not an override file — Compose merges `env_file` lists rather than replacing them. The stack runs green in CI (run 40217713526). `deploy.sh` lands in M7. |
 | M5 CI image/scan/publish | **done** | `check` + `image` (buildx, GHA cache, Trivy on fixable HIGH/CRITICAL) + `smoke` (prod compose stack, real streaming completion, `/readyz` sha must equal the built sha, `switchyard verify`) + `publish` (GHCR by full sha and `:main`, main only) + inert `terraform`. CI now runs on feature branches. Full pipeline green: run 40217713526. Trivy found 4 fixable HIGHs, all in packaging tooling — pip/setuptools/wheel removed from the runtime image. `release.yml`: PyPI gated behind `PUBLISH_PYPI`, `github-release` no longer depends on it. **`publish` has never run** (needs a push to `main`). |
 | M6 Terraform | not started | |
 | M7 Continuous deployment | not started | |
